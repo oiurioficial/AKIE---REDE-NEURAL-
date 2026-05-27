@@ -1378,6 +1378,8 @@ if (global.akieModel) {
 }
 
 return true;
+}
+    
 
 async function _markBootstrapComplete(db, episodes, nodes, vocabSize) {
   await db.collection('akie_worker_status').doc('bootstrap').set({
