@@ -353,14 +353,25 @@ class AKIEModel {
     const oldWeights = this.model.getWeights();
     const oldEmbSize = this.embeddingVocabSize;
 
-    // Rebuild com novo tamanho — substituir vocab.size temporariamente
-    // sem mutar o objeto real (que é state.vocab compartilhado)
-    const realVocab = this.vocab;
-    this.vocab = Object.create(realVocab, {
-      size: { value: newVocabSize, writable: false },
-    });
+    // Patch temporário do vocab.size para o build()
+    // Vocabulary.size é um getter sobre id2token.length — patchear diretamente
+    const realId2token = this.vocab.id2token;
+    const paddingNeeded = newVocabSize - realId2token.length;
+    const tempTokens = paddingNeeded > 0
+      ? Array.from({ length: paddingNeeded }, (_, i) => `<EXPAND_${oldEmbSize + i}>`)
+      : [];
+    if (tempTokens.length > 0) {
+      this.vocab.id2token = [...realId2token, ...tempTokens];
+      for (const t of tempTokens) {
+        if (!(t in this.vocab.token2id)) this.vocab.token2id[t] = this.vocab.id2token.indexOf(t);
+      }
+    }
+
     this.build();
-    this.vocab = realVocab; // restaurar referência real
+
+    // Restaurar — os tokens temporários de padding serão substituídos
+    // por tokens reais quando o vocab crescer organicamente
+    // (mantemos no vocab para não quebrar IDs já emitidos)
 
     // Copiar pesos das camadas que não mudaram
     const newWeights = this.model.getWeights();
