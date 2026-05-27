@@ -26,7 +26,7 @@ const HPARAMS = {
   maxSeqLen:  32,    // comprimento máximo de contexto
   batchSize:  16,    // tamanho de batch para treino
   learningRate: 0.001,
-  temperature: 0.8,  // controla aleatoriedade da geração (0=greedy, 1=criativo)
+  temperature: 0.45, // reduzido: modelo em estágio inicial precisa de menos aleatoriedade
   maxGenTokens: 40,  // máximo de tokens gerados por resposta
   minNewData:  3,    // mínimo de exemplos novos para disparar treino
 };
@@ -168,8 +168,12 @@ class AKIEModel {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Gera texto a partir de um prompt usando amostragem com temperatura.
-   * NÃO é template — é inferência real da rede neural.
+   * Gera texto usando beam search com repetition penalty.
+   *
+   * Beam search mantém as `beamWidth` melhores sequências candidatas
+   * a cada passo e escolhe a de maior score ao final.
+   * Repetition penalty reduz a probabilidade de tokens já gerados,
+   * evitando loops de palavras repetidas.
    *
    * @param {string} prompt        - Texto de entrada (contexto)
    * @param {number} maxTokens     - Máximo de tokens a gerar
@@ -179,64 +183,100 @@ class AKIEModel {
   generate(prompt = '', maxTokens = null, temperature = null) {
     if (!this.ready) return null;
 
-    const maxT = maxTokens || this.hparams.maxGenTokens;
-    const temp = temperature !== null ? temperature : this.hparams.temperature;
+    const maxT      = maxTokens || this.hparams.maxGenTokens;
+    const temp      = temperature !== null ? temperature : this.hparams.temperature;
+    const beamWidth = 3;
+    const repPenalty = 1.3; // fator de penalidade para tokens já gerados
 
-    // Tokenizar prompt
-    const promptIds = this.vocab.tokenize(prompt);
-    // Remove EOS do fim para continuar gerando
-    const contextIds = promptIds.filter(id => id !== SPECIAL.EOS);
+    // Tokenizar prompt — remover EOS para continuar gerando
+    const promptIds  = this.vocab.tokenize(prompt).filter(id => id !== SPECIAL.EOS);
 
-    const generated = [];
-    let currentContext = [...contextIds];
+    // Cada beam: { context: number[], tokens: number[], score: number }
+    let beams = [{ context: [...promptIds], tokens: [], score: 0.0 }];
 
     for (let step = 0; step < maxT; step++) {
-      // Preparar contexto com padding
-      const padLen = this.hparams.maxSeqLen;
-      const padded = [
-        ...Array(Math.max(0, padLen - currentContext.length)).fill(SPECIAL.PAD),
-        ...currentContext.slice(-padLen),
-      ];
+      const candidates = [];
 
-      // Inferência
-      const inputTensor = tf.tensor2d([padded], [1, padLen], 'int32');
-      const rawLogits   = this.model.predict(inputTensor);
+      for (const beam of beams) {
+        // Preparar contexto com padding à esquerda
+        const padLen = this.hparams.maxSeqLen;
+        const padded = [
+          ...Array(Math.max(0, padLen - beam.context.length)).fill(SPECIAL.PAD),
+          ...beam.context.slice(-padLen),
+        ];
 
-      // Cast explícito para float32 — tfjs-node retorna int32 quando o input
-      // da camada de embedding é int32, causando erro em floor() no dataSync
-      const logits = rawLogits.dtype === 'float32'
-        ? rawLogits
-        : rawLogits.cast('float32');
+        // Inferência
+        const inputTensor = tf.tensor2d([padded], [1, padLen], 'int32');
+        const rawLogits   = this.model.predict(inputTensor);
+        const logits      = rawLogits.dtype === 'float32'
+          ? rawLogits : rawLogits.cast('float32');
 
-      // Amostragem com temperatura
-      const nextId = this._sampleWithTemperature(logits, temp);
-      inputTensor.dispose();
-      if (logits !== rawLogits) rawLogits.dispose();
-      logits.dispose();
+        let probs = Array.from(logits.dataSync());
+        inputTensor.dispose();
+        if (logits !== rawLogits) rawLogits.dispose();
+        logits.dispose();
 
-      // Parar em EOS
-      if (nextId === SPECIAL.EOS) break;
-      // Pular PAD e BOS na saída
-      if (nextId === SPECIAL.PAD || nextId === SPECIAL.BOS) continue;
+        // Repetition penalty — dividir prob de tokens já gerados
+        const generatedSet = new Set(beam.tokens);
+        probs = probs.map((p, id) =>
+          generatedSet.has(id) ? p / repPenalty : p
+        );
 
-      generated.push(nextId);
-      currentContext.push(nextId);
+        // Aplicar temperatura e re-normalizar
+        const logP  = probs.map(p => Math.log(Math.max(p, 1e-10)) / Math.max(temp, 0.01));
+        const maxLP = Math.max(...logP);
+        const exps  = logP.map(lp => Math.exp(lp - maxLP));
+        const sum   = exps.reduce((a, b) => a + b, 0);
+        const scaled = exps.map(e => e / sum);
+
+        // Top-K: manter os beamWidth tokens mais prováveis como candidatos
+        const topK = scaled
+          .map((p, id) => ({ id, p }))
+          .filter(t => t.id !== SPECIAL.PAD && t.id !== SPECIAL.BOS)
+          .sort((a, b) => b.p - a.p)
+          .slice(0, beamWidth);
+
+        for (const { id: nextId, p } of topK) {
+          candidates.push({
+            context: [...beam.context, nextId],
+            tokens:  [...beam.tokens, nextId],
+            score:   beam.score + Math.log(Math.max(p, 1e-10)),
+            done:    nextId === SPECIAL.EOS,
+          });
+        }
+      }
+
+      // Selecionar os beamWidth melhores candidatos
+      candidates.sort((a, b) => b.score - a.score);
+      beams = candidates.slice(0, beamWidth);
+
+      // Se todos terminaram com EOS, parar
+      if (beams.every(b => b.done)) break;
+
+      // Remover beams que terminaram da lista ativa (mas guardar o melhor)
+      const done   = beams.filter(b => b.done);
+      const active = beams.filter(b => !b.done);
+      if (active.length === 0) { beams = done; break; }
+      beams = active;
     }
 
-    return this.vocab.detokenize(generated);
+    // Retornar o beam com maior score, ignorando EOS no output
+    const best = beams.sort((a, b) => b.score - a.score)[0];
+    const outputIds = best.tokens.filter(
+      id => id !== SPECIAL.EOS && id !== SPECIAL.PAD && id !== SPECIAL.BOS
+    );
+
+    return this.vocab.detokenize(outputIds);
   }
 
   /**
-   * Amostragem com temperatura a partir de logits float32.
-   * Cast deve ter sido feito antes de chamar este método.
+   * Amostragem simples com temperatura — mantida para uso interno / self-play.
    * @private
    */
   _sampleWithTemperature(logitsTensor, temperature) {
-    // Float32Array.indexOf não existe — usar Array.from() para converter
     const probs = Array.from(logitsTensor.dataSync());
 
     if (temperature <= 0.01) {
-      // Greedy: loop linear é mais seguro que Math.max(...probs) para vocabs grandes
       let maxIdx = 0;
       for (let i = 1; i < probs.length; i++) {
         if (probs[i] > probs[maxIdx]) maxIdx = i;
@@ -244,14 +284,12 @@ class AKIEModel {
       return maxIdx;
     }
 
-    // Aplicar temperatura: dividir log-probs por temperature e re-normalizar
     const logProbs = probs.map(p => Math.log(Math.max(p, 1e-10)) / temperature);
     const maxLog   = Math.max(...logProbs);
     const exps     = logProbs.map(lp => Math.exp(lp - maxLog));
     const sumExps  = exps.reduce((a, b) => a + b, 0);
     const scaled   = exps.map(e => e / sumExps);
 
-    // Amostragem multinomial
     const rand = Math.random();
     let cumSum = 0;
     for (let i = 0; i < scaled.length; i++) {
