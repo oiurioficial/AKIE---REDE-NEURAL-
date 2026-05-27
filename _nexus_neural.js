@@ -13,6 +13,12 @@
  *
  * NLP Layer: biblioteca `natural` para stemming PT-BR, TF-IDF e similaridade
  * — enriquece pares de treino e melhora qualidade do scoring de geração.
+ *
+ * CORREÇÕES v4:
+ *   - load(): detecta vocab crescido e expande automaticamente
+ *   - load(): diagnóstico de persistência do volume
+ *   - expandVocabulary(): proteção contra undefined weights + fallback seguro
+ *   - generate(): proteção contra beam vazio e tokens inválidos
  */
 
 const tf = require('@tensorflow/tfjs-node');
@@ -114,7 +120,15 @@ try {
   console.log('[NLP] Biblioteca `natural` carregada. Stemming PT-BR, TF-IDF e similaridade ativos.');
 } catch (e) {
   // natural não instalada — sistema continua sem degradação
-  NaturalNLP = { isReady: false, stem: t => t, stemSentence: s => s.split(/\s+/), similarity: () => 0, generationScore: () => 0, addDocument: () => {}, topTerms: () => [] };
+  NaturalNLP = { 
+    isReady: false, 
+    stem: t => t, 
+    stemSentence: s => s.toLowerCase().split(/\s+/).filter(Boolean), 
+    similarity: () => 0, 
+    generationScore: () => 0, 
+    addDocument: () => {}, 
+    topTerms: () => [] 
+  };
   console.log('[NLP] `natural` não encontrada. Rodando sem NLP avançado. Execute: npm install natural');
 }
 
@@ -474,7 +488,11 @@ class AKIEModel {
     }
 
     const finalSelection = [...completedBeams, ...beams];
-    if (finalSelection.length === 0) return '';
+    
+    // ── Proteção: se todos os beams falharam ──
+    if (finalSelection.length === 0 || !finalSelection[0]) {
+      return '';
+    }
 
     // Reranking com NLP semântico: se natural está disponível, combina
     // score do beam (log-prob) com similaridade de stems prompt→geração.
@@ -494,9 +512,20 @@ class AKIEModel {
       finalSelection.sort((a, b) => b.score - a.score);
     }
 
-    const outputTokens = finalSelection[0].generatedIds.filter(
+    // ── Garantir que há tokens válidos ──
+    const bestBeam = finalSelection[0];
+    if (!bestBeam.generatedIds || bestBeam.generatedIds.length === 0) {
+      return '';
+    }
+
+    const outputTokens = bestBeam.generatedIds.filter(
       id => id !== SPECIAL.EOS && id !== SPECIAL.PAD && id !== SPECIAL.BOS
     );
+
+    // Se após filtrar não sobrar nada, retorna vazio
+    if (outputTokens.length === 0) {
+      return '';
+    }
 
     return this.vocab.detokenize(outputTokens);
   }
@@ -510,7 +539,13 @@ class AKIEModel {
     await fs.promises.mkdir(dir, { recursive: true });
     await this.model.save(`file://${dir}`);
 
-    const meta = { trainSteps: this.trainSteps, vocabSize: this.vocab.size, hparams: this.hparams, savedAt: new Date().toISOString() };
+    const meta = { 
+      trainSteps: this.trainSteps, 
+      vocabSize: this.vocab.size, 
+      embeddingVocabSize: this.embeddingVocabSize,
+      hparams: this.hparams, 
+      savedAt: new Date().toISOString() 
+    };
     await fs.promises.writeFile(path.join(dir, 'akie_meta.json'), JSON.stringify(meta, null, 2));
     await fs.promises.writeFile(path.join(dir, 'akie_vocab.json'), JSON.stringify(this.vocab.toJSON(), null, 2));
     console.log(`[AKIE] Transformer salvo em ${dir} (steps: ${this.trainSteps})`);
@@ -519,25 +554,80 @@ class AKIEModel {
   async load(dir) {
     try {
       const modelPath = path.join(dir, 'model.json');
-      if (!fs.existsSync(modelPath)) return false;
+      
+      // ── Diagnóstico de persistência ──
+      console.log(`[AKIE] Procurando modelo em: ${modelPath}`);
+      console.log(`[AKIE] Diretório ${dir} existe? ${fs.existsSync(dir)}`);
+      
+      if (fs.existsSync(dir)) {
+        const files = fs.readdirSync(dir);
+        console.log(`[AKIE] Arquivos no diretório: ${files.join(', ') || 'nenhum'}`);
+      }
+      
+      if (!fs.existsSync(modelPath)) {
+        console.log(`[AKIE] Nenhum modelo encontrado em ${modelPath}`);
+        return false;
+      }
 
+      // Verificar se o modelo é compatível com o vocab atual
+      const metaPath = path.join(dir, 'akie_meta.json');
+      let savedVocabSize = this.vocab.size;
+      
+      if (fs.existsSync(metaPath)) {
+        const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
+        this.trainSteps = meta.trainSteps || 0;
+        savedVocabSize = meta.vocabSize || this.vocab.size;
+      }
+
+      // Se o vocab atual é maior que o salvo, precisa rebuild com expansão
+      if (this.vocab.size > savedVocabSize) {
+        console.log(`[AKIE] Vocab cresceu desde último save (${savedVocabSize} → ${this.vocab.size}).`);
+        console.log(`[AKIE] Carregando modelo base e expandindo...`);
+        
+        this.model = await tf.loadLayersModel(`file://${dir}/model.json`);
+        this.optimizer = tf.train.adam(this.hparams.learningRate);
+        this.model.compile({ 
+          optimizer: this.optimizer, 
+          loss: 'sparseCategoricalCrossentropy', 
+          metrics: ['accuracy'] 
+        });
+
+        try {
+          this.embeddingVocabSize = this.model.getLayer('embedding').getWeights()[0].shape[0];
+        } catch(e) {
+          this.embeddingVocabSize = savedVocabSize;
+        }
+
+        this.ready = true;
+        
+        // Expandir para o tamanho atual do vocab
+        if (this.vocab.size > this.embeddingVocabSize) {
+          await this.expandVocabulary(this.vocab.size);
+        }
+        
+        console.log(`[AKIE] Transformer carregado e expandido. (steps: ${this.trainSteps}, embVocab: ${this.embeddingVocabSize})`);
+        return true;
+      }
+
+      // Carregamento normal (vocab compatível)
       this.model = await tf.loadLayersModel(`file://${dir}/model.json`);
       this.optimizer = tf.train.adam(this.hparams.learningRate);
-      this.model.compile({ optimizer: this.optimizer, loss: 'sparseCategoricalCrossentropy', metrics: ['accuracy'] });
-
-      const metaPath = path.join(dir, 'akie_meta.json');
-      if (fs.existsSync(metaPath)) {
-        this.trainSteps = JSON.parse(await fs.promises.readFile(metaPath, 'utf8')).trainSteps || 0;
-      }
+      this.model.compile({ 
+        optimizer: this.optimizer, 
+        loss: 'sparseCategoricalCrossentropy', 
+        metrics: ['accuracy'] 
+      });
 
       try {
         this.embeddingVocabSize = this.model.getLayer('embedding').getWeights()[0].shape[0];
       } catch(e) {
         this.embeddingVocabSize = this.vocab.size;
       }
+      
       this.ready = true;
       console.log(`[AKIE] Transformer carregado. (steps: ${this.trainSteps}, embVocab: ${this.embeddingVocabSize})`);
       return true;
+      
     } catch (err) {
       console.error('[AKIE] Falha ao carregar modelo:', err.message);
       return false;
@@ -547,36 +637,51 @@ class AKIEModel {
   /**
    * Expansão Cirúrgica de Vocabulário em Runtime.
    * Redimensiona dinamicamente os kernels mantendo os pesos aprendidos intactos.
+   * CORRIGIDO: proteção contra undefined weights e fallback seguro.
    */
   async expandVocabulary(newVocabSize) {
     if (!this.ready) return;
-  if (newVocabSize <= this.embeddingVocabSize) return;
+    if (newVocabSize <= this.embeddingVocabSize) return;
 
-    console.log(`[AKIE] Reconfigurando dimensões do Transformer: ${this.vocab.size} → ${newVocabSize}`);
+    console.log(`[AKIE] Reconfigurando dimensões do Transformer: ${this.embeddingVocabSize} → ${newVocabSize}`);
 
     const oldWeights = this.model.getWeights();
-    this.vocab = { ...this.vocab, size: newVocabSize };
+    const oldVocabSize = this.embeddingVocabSize;
+    
+    // Atualiza o vocab size antes do rebuild
+    this.embeddingVocabSize = newVocabSize;
+    
+    // Reconstrói o modelo com novo tamanho
     this.build();
 
     const newWeights = this.model.getWeights();
     const updatedWeights = newWeights.map((w, i) => {
       const oldW = oldWeights[i];
-      if (!oldW) return w;
+      if (!oldW) {
+        console.warn(`[AKIE] Peso ${i} não encontrado nos pesos antigos — inicializando do zero`);
+        return w;
+      }
 
       const oldShape = oldW.shape;
       const newShape = w.shape;
 
-      if (JSON.stringify(oldShape) === JSON.stringify(newShape)) return oldW;
-
-      // Caso 1: Kernel do Embedding ([vocabSize, embDim]) — Primeira dimensão expande
-      if (oldShape.length === 2 && newShape[0] > oldShape[0] && oldShape[1] === newShape[1]) {
-        const merged = new Float32Array(w.dataSync());
-        merged.set(oldW.dataSync());
-        return tf.tensor(merged, newShape);
+      // Dimensões iguais: copia direto
+      if (oldShape.length === newShape.length && 
+          oldShape.every((dim, idx) => dim === newShape[idx])) {
+        return oldW;
       }
 
-      // Caso 2: Kernel do Dense de Saída ([embDim, vocabSize]) — Segunda dimensão expande
-      if (oldShape.length === 2 && newShape[1] > oldShape[1] && oldShape[0] === newShape[0]) {
+      // Caso 1: Kernel do Embedding ([vocabSize, embDim])
+      if (oldShape.length === 2 && newShape.length === 2 &&
+          newShape[0] > oldShape[0] && oldShape[1] === newShape[1]) {
+        const merged = new Float32Array(w.dataSync());
+        merged.set(oldW.dataSync());
+        return tf.tensor(merged, newShape, 'float32');
+      }
+
+      // Caso 2: Kernel do Dense de Saída ([embDim, vocabSize])
+      if (oldShape.length === 2 && newShape.length === 2 &&
+          newShape[1] > oldShape[1] && oldShape[0] === newShape[0]) {
         const oldData = oldW.dataSync();
         const merged = new Float32Array(w.dataSync());
         const [rows, oldCols] = oldShape;
@@ -587,22 +692,29 @@ class AKIEModel {
             merged[r * newCols + c] = oldData[r * oldCols + c];
           }
         }
-        return tf.tensor(merged, newShape);
+        return tf.tensor(merged, newShape, 'float32');
       }
 
-      // Caso 3: Bias do Dense de Saída ([vocabSize]) — Vetor 1D expande
-      if (oldShape.length === 1 && newShape[0] > oldShape[0]) {
+      // Caso 3: Bias do Dense de Saída ([vocabSize])
+      if (oldShape.length === 1 && newShape.length === 1 &&
+          newShape[0] > oldShape[0]) {
         const merged = new Float32Array(w.dataSync());
         merged.set(oldW.dataSync());
-        return tf.tensor(merged, newShape);
+        return tf.tensor(merged, newShape, 'float32');
       }
 
+      // Fallback: mantém o peso novo
+      console.warn(`[AKIE] Peso ${i}: forma incompatível ${oldShape} → ${newShape} — inicializando do zero`);
       return w;
     });
 
     this.model.setWeights(updatedWeights);
-    oldWeights.forEach(w => w.dispose());
-    this.embeddingVocabSize = newVocabSize;
+    
+    // Libera memória dos pesos antigos
+    oldWeights.forEach(w => {
+      try { w.dispose(); } catch(e) { /* já foi liberado */ }
+    });
+    
     console.log(`[AKIE] Expansão concluída com preservação de memória sináptica.`);
   }
 
