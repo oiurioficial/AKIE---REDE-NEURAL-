@@ -17,6 +17,11 @@
  *    - Adicionado: servidor HTTP na porta 3000
  *    - Adicionado: endpoint POST /generate para o NEXUS
  *    - Adicionado: endpoint GET  /status para monitoramento
+ *
+ *  NOVO v3:
+ *    - Integrado akie_behavior.js: pré-processamento de intenção
+ *    - Fallback inteligente: refino sem modelo, social/analyze com modelo
+ *    - Contexto dinâmico baseado no modo detectado
  */
 
 require('dotenv').config();
@@ -37,6 +42,12 @@ const {
   selfPlayPairs,
 } = require('./_akie_dataset');
 
+// ── NOVO: Comportamento padrão do AKIE ──────────────────────────
+const {
+  processBehavior,
+  getDefaultContext,
+} = require('./akie_behavior');
+
 // ---------------------------------------------------------------------------
 // Configuração
 // ---------------------------------------------------------------------------
@@ -49,6 +60,13 @@ const CONFIG = {
   consolidationAfter:  1,
   expansionAfter:      3,
   selfPlayAfter:       2,
+  // NOVO: limites de geração por modo
+  generationLimits: {
+    social:  { maxTokens: 60,  temperature: 0.7 },
+    analyze: { maxTokens: 150, temperature: 0.5 },
+    code:    { maxTokens: 500, temperature: 0.3 },
+    refino:  { maxTokens: 100, temperature: 0.4 },
+  },
 };
 
 const MODE = {
@@ -75,6 +93,14 @@ const state = {
     lastLoss:        null,
     lastAccuracy:    null,
     trainCycles:     0,
+  },
+  // NOVO: contadores de geração por modo
+  generationStats: {
+    social:  0,
+    analyze: 0,
+    code:    0,
+    refino:  0,
+    direct:  0,
   },
 };
 
@@ -108,6 +134,7 @@ function startHttpServer() {
         metrics:     state.metrics,
         model:       stats,
         mode_history: state.modeHistory.slice(-5),
+        generation_stats: state.generationStats,
       }));
       return;
     }
@@ -118,7 +145,7 @@ function startHttpServer() {
     if (req.method === 'POST' && req.url === '/generate') {
       let body = '';
       req.on('data', chunk => { body += chunk; });
-      req.on('end', () => {
+      req.on('end', async () => {
         try {
           const { prompt, max_tokens, temperature } = JSON.parse(body || '{}');
 
@@ -134,24 +161,63 @@ function startHttpServer() {
             return;
           }
 
+          // ── NOVO: Processar comportamento ANTES de gerar ──────
+          const behavior = processBehavior(prompt, {
+            language: 'pt',
+            refineryAvailable: false, // sem Refinaria externa por enquanto
+          });
+
+          console.log(`[GENERATE] Modo: ${behavior.mode} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
+
+          // ── Se behavior tem output direto (refino/clarificação) ──
+          if (behavior.output) {
+            state.generationStats.direct++;
+            res.writeHead(200, headers);
+            res.end(JSON.stringify({
+              ok:        true,
+              prompt:    prompt,
+              generated: behavior.output,
+              mode:      behavior.mode,
+              source:    'behavior_direct',
+            }));
+            return;
+          }
+
+          // ── Caso contrário: gerar com o modelo ────────────────
+          // Usar limites do modo detectado ou os fornecidos na requisição
+          const modeLimits = CONFIG.generationLimits[behavior.mode] || CONFIG.generationLimits.social;
+          const finalMaxTokens   = max_tokens  || modeLimits.maxTokens;
+          const finalTemperature = temperature || modeLimits.temperature;
+
+          // Construir prompt enriquecido com contexto do modo
+          const enrichedPrompt = behavior.context
+            ? `${behavior.context}\n\n[ENTRADA DO USUÁRIO]\n${behavior.input}`
+            : behavior.input;
+
           const generated = state.model.generate(
-            prompt,
-            max_tokens  || 30,
-            temperature || 0.7
+            enrichedPrompt,
+            finalMaxTokens,
+            finalTemperature
           );
 
+          // Atualizar contadores
+          state.generationStats[behavior.mode] = (state.generationStats[behavior.mode] || 0) + 1;
+
           // Marcar episódio para treino futuro (fire-and-forget)
-          saveGenerationEpisode(prompt, generated).catch(() => {});
+          saveGenerationEpisode(prompt, generated, behavior.mode).catch(() => {});
 
           res.writeHead(200, headers);
           res.end(JSON.stringify({
             ok:        true,
             prompt:    prompt,
             generated: generated || '',
+            mode:      behavior.mode,
             steps:     state.model.trainSteps,
+            source:    'model_generated',
           }));
 
         } catch (err) {
+          console.error('[GENERATE] Erro:', err.message);
           res.writeHead(500, headers);
           res.end(JSON.stringify({ error: err.message }));
         }
@@ -190,22 +256,28 @@ function startHttpServer() {
   server.listen(CONFIG.httpPort, () => {
     console.log(`[HTTP] Servidor rodando na porta ${CONFIG.httpPort}`);
     console.log(`[HTTP] Endpoints: GET /status | POST /generate | POST /feedback`);
+    console.log(`[HTTP] Behavior engine: ATIVO (akie_behavior.js)`);
   });
 
   return server;
 }
 
 // Salva geração como episódio para treino futuro
-async function saveGenerationEpisode(prompt, generated) {
+// NOVO: inclui o modo detectado no episódio
+async function saveGenerationEpisode(prompt, generated, mode) {
   if (!state.db || !generated) return;
-  await state.db.collection('nexus_episodes').add({
-    input:        prompt,
-    output:       generated,
-    layer:        'akie_generation',
-    feedback:     null,
-    processed:    false,
-    created_at:   new Date().toISOString(),
-  });
+  try {
+    await state.db.collection('nexus_episodes').add({
+      input:        prompt,
+      output:       generated,
+      layer:        `akie_${mode || 'generation'}`,
+      feedback:     null,
+      processed:    false,
+      created_at:   new Date().toISOString(),
+    });
+  } catch (e) {
+    // fire-and-forget — não crítico
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +286,8 @@ async function saveGenerationEpisode(prompt, generated) {
 
 async function init() {
   console.log('════════════════════════════════════════');
-  console.log('  AKIE Training Worker v2 — iniciando');
+  console.log('  AKIE Training Worker v3 — iniciando');
+  console.log('  Behavior Engine: akie_behavior.js');
   console.log(`  ${new Date().toISOString()}`);
   console.log('════════════════════════════════════════');
 
@@ -234,17 +307,15 @@ async function init() {
 
   // Bootstrap — garante que o sistema nunca inicie com grafo vazio
   // Idempotente: só roda uma vez na vida do Firestore
- const bootstrapped = await runBootstrap(state.db, state.vocab);
+  const bootstrapped = await runBootstrap(state.db, state.vocab);
 
-if (bootstrapped) {
-  await saveVocab(state.vocab);
-
-  console.log('[INIT] Recriando modelo após bootstrap...');
-
-  state.model = new AKIEModel(state.vocab);
-  state.model.build();
-  await state.model.save(CONFIG.modelDir);
-}
+  if (bootstrapped) {
+    await saveVocab(state.vocab);
+    console.log('[INIT] Recriando modelo após bootstrap...');
+    state.model = new AKIEModel(state.vocab);
+    state.model.build();
+    await state.model.save(CONFIG.modelDir);
+  }
 
   console.log(`[INIT] Vocabulário: ${state.vocab.size} tokens`);
 
@@ -268,6 +339,7 @@ if (bootstrapped) {
     started_at:  new Date().toISOString(),
     status:      'running',
     model_stats: state.model.getStats(),
+    behavior_engine: 'akie_behavior.js',
   });
 
   console.log('[INIT] Worker pronto.\n');
@@ -365,7 +437,7 @@ async function runMode(mode, ctx = {}) {
     }
     case MODE.EXPANSION: {
       const vocabBefore = state.vocab.size;
-     pairs = await fetchWebPatterns(state.db, state.vocab, 1);
+      pairs = await fetchWebPatterns(state.db, state.vocab, 1);
       desc  = `web crawl → ${pairs.length} pares`;
       // Sempre verificar crescimento de vocab, mesmo sem pairs
       // O fetchWebPatterns adiciona tokens ao vocab independentemente de gerar pares
@@ -474,6 +546,7 @@ async function reportStatus(mode) {
       total_pairs: state.totalPairsTrained,
       metrics:     state.metrics,
       model_stats: state.model.getStats(),
+      generation_stats: state.generationStats,
     }, { merge: true });
   } catch (e) { /* não crítico */ }
 }
