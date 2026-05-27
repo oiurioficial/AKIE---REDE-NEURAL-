@@ -3,31 +3,13 @@
  *
  * Pipeline de dados para treino contínuo do AKIE.
  *
- * CORREÇÕES v2:
- *   - nexus_nodes → nexus_graph (alinhado com o motor NEXUS)
- *   - confirmed === true → confidence === 'confirmed'
- *   - Campo weight → usar confidence + relations[].weight
- *   - fetchGraphSentences usa nexus_graph corretamente
- *   - fetchWebPatterns usa nexus_graph com filtro por score baixo
- *
- * NOVO v3 — EXPANSÃO AUTOMÁTICA DO GRAFO:
- *   - extractAndExpandGraph(): extrai palavras-chave de frases e cria nós
- *   - Integrado em fetchWebPatterns() e selfPlayPairs()
- *   - Evita duplicação, limita 20 nós/ciclo
- *   - Nós gerados com confidence: 'generated'
- *
- * CORREÇÕES v4:
- *   - isNaN(w) → !/^\d+$/.test(w) (filtro correto de números)
- *   - STOP_WORDS expandida com palavras problemáticas
- *   - Filtro de qualidade para pares do web crawl
- *   - Fallback com queries fixas quando grafo sem candidatos
- *   - selfPlayPairs com fallback para nós 'generated'
- *
- * CORREÇÕES v5 — DESESTAGNAÇÃO DO MODELO:
- *   - fetchGraphSentences(): inclui nós 'generated' além de 'confirmed'
- *   - promoteGeneratedNodes(): promove nós generated → confirmed após uso
- *   - Web crawl: adiciona tokens novos ao vocab em vez de descartar
- *   - Web crawl: filtro de qualidade mais permissivo (1 token conhecido basta)
+ * CORREÇÕES v6 — DESTRAVANDO A EVOLUÇÃO:
+ *   - fetchGraphSentences: limiar de peso reduzido para 0.20 (aproveita relações geradas)
+ *   - extractAndExpandGraph: peso inicial das relações aumentado para 0.45
+ *   - extractAndExpandGraph: número de co-ocorrências expandido para 8
+ *   - fetchWebPatterns: filtro de qualidade seguro (Array.isArray)
+ *   - fetchWebPatterns: fallback com queries fixas mais relevantes
+ *   - Self-play: incrementa usage_count para acelerar promoção de nós
  */
 
 const { tokenizeText, makeTrainingPairs } = require('./_akie_vocab');
@@ -58,7 +40,7 @@ const EXPANSION_CONFIG = {
     'ele', 'ela', 'eles', 'elas', 'este', 'esta', 'esse', 'essa',
     'isso', 'isto', 'aquilo', 'meu', 'minha', 'seu', 'sua',
     'nosso', 'nossa', 'qual', 'quais', 'quem', 'cujo', 'cuja',
-    // ── Palavras problemáticas detectadas em produção ──
+    // Palavras problemáticas detectadas em produção
     'unk', 'pode', 'faz', 'vai', 'tem', 'pra', 'pro',
     'tudo', 'nada', 'algo', 'cada', 'todo', 'toda',
     'outro', 'outra', 'outros', 'outras',
@@ -79,10 +61,6 @@ const EXPANSION_CONFIG = {
 // FONTE 1 — Episódios reais de interação
 // ---------------------------------------------------------------------------
 
-/**
- * Busca episódios não processados do Firestore.
- * processed=false → ainda não foram usados para treino.
- */
 async function fetchUserEpisodes(db, limit = 50) {
   const snap = await db.collection('nexus_episodes')
     .where('processed', '==', false)
@@ -116,10 +94,6 @@ async function fetchUserEpisodes(db, limit = 50) {
   return episodes;
 }
 
-/**
- * Converte episódios em pares de treino.
- * Feedback positivo → peso 2x. Negativo → descartado.
- */
 function episodesToPairs(episodes, vocab) {
   const allPairs = [];
 
@@ -140,17 +114,9 @@ function episodesToPairs(episodes, vocab) {
 
 // ---------------------------------------------------------------------------
 // FONTE 2 — Grafo semântico NEXUS → frases de treino
-// CORRIGIDO v5: inclui nós 'generated' + promove após uso
 // ---------------------------------------------------------------------------
 
-/**
- * Busca nós do nexus_graph (confirmed + generated) e converte em frases.
- * 
- * NOVO v5: Inclui confidence 'generated' para desestagnar o modelo.
- * Nós 'generated' com usage_count alto são promovidos a 'confirmed'.
- */
 async function fetchGraphSentences(db, limit = 300) {
-  // Buscar confirmed E generated (v5: desestagnação)
   const snap = await db.collection('nexus_graph')
     .where('confidence', 'in', ['confirmed', 'generated'])
     .limit(limit)
@@ -163,13 +129,12 @@ async function fetchGraphSentences(db, limit = 300) {
     const node = doc.data();
     const label = node.label || node.id.replace(/_/g, ' ');
 
-    // Verificar promoção: generated + usage_count >= threshold → confirmed
     if (node.confidence === 'generated' && (node.usage_count || 0) >= EXPANSION_CONFIG.PROMOTE_AFTER_USES) {
       nodesToPromote.push(doc.ref);
     }
 
-    // Relações com peso significativo (reduzido para 0.40 para incluir mais)
-    const rels = (node.relations || []).filter(r => r.weight >= 0.40);
+    // 🔥 CORREÇÃO v6: limiar reduzido para 0.20 (aproveita relações geradas com peso 0.45)
+    const rels = (node.relations || []).filter(r => r.weight >= 0.20);
 
     for (const rel of rels) {
       const target   = (rel.target || '').replace(/_/g, ' ');
@@ -177,14 +142,12 @@ async function fetchGraphSentences(db, limit = 300) {
       if (sentence) sentences.push(sentence);
     }
 
-    // Contextos como frases simples
     (node.contexts || []).forEach(ctx => {
       if (ctx && ctx.length > 2) {
         sentences.push(`${label} aparece em ${ctx.replace(/_/g, ' ')}`);
       }
     });
 
-    // Verbos como frases simples
     (node.verbs || []).slice(0, 2).forEach(verb => {
       if (verb && verb.length > 3) {
         sentences.push(`${label} ${verb.replace(/_/g, ' ')}`);
@@ -192,7 +155,6 @@ async function fetchGraphSentences(db, limit = 300) {
     });
   });
 
-  // Promover nós que atingiram o threshold
   if (nodesToPromote.length > 0) {
     const batch = db.batch();
     nodesToPromote.forEach(ref => {
@@ -209,9 +171,6 @@ async function fetchGraphSentences(db, limit = 300) {
   return sentences;
 }
 
-/**
- * Converte tipo de relação NEXUS em frase natural PT-BR.
- */
 function relationToSentence(source, relType, target) {
   const s = source.replace(/_/g, ' ');
   const t = target.replace(/_/g, ' ');
@@ -280,13 +239,9 @@ function graphSentencesToPairs(sentences, vocab) {
 }
 
 // ---------------------------------------------------------------------------
-// PROMOÇÃO DE NÓS — generated → confirmed
+// PROMOÇÃO DE NÓS
 // ---------------------------------------------------------------------------
 
-/**
- * Promove nós 'generated' com usage_count >= threshold para 'confirmed'.
- * Chamado periodicamente pelo scheduler.
- */
 async function promoteGeneratedNodes(db) {
   const snap = await db.collection('nexus_graph')
     .where('confidence', '==', 'generated')
@@ -313,9 +268,6 @@ async function promoteGeneratedNodes(db) {
 // EXPANSÃO AUTOMÁTICA DO GRAFO
 // ---------------------------------------------------------------------------
 
-/**
- * Extrai palavras-chave de um conjunto de frases e expande o nexus_graph.
- */
 async function extractAndExpandGraph(db, sentences, source = 'unknown') {
   if (!sentences || sentences.length === 0) return 0;
 
@@ -388,13 +340,13 @@ async function extractAndExpandGraph(db, sentences, source = 'unknown') {
         co.length >= EXPANSION_CONFIG.MIN_WORD_LENGTH &&
         !EXPANSION_CONFIG.STOP_WORDS.has(co)
       )
-      .slice(0, 5);
+      .slice(0, 8); // 🔥 v6: aumentado para 8 co-ocorrências
 
     for (const coWord of cooccurArray) {
       relations.push({
         target: sanitizeNodeId(coWord),
         type: 'related_to',
-        weight: 0.3,
+        weight: 0.45, // 🔥 v6: peso inicial aumentado para 0.45
       });
     }
 
@@ -435,9 +387,6 @@ async function extractAndExpandGraph(db, sentences, source = 'unknown') {
   return newNodes.length;
 }
 
-/**
- * Sanitiza uma palavra para uso como ID de nó no Firestore.
- */
 function sanitizeNodeId(word) {
   return word
     .toLowerCase()
@@ -449,9 +398,6 @@ function sanitizeNodeId(word) {
     .substring(0, 80);
 }
 
-/**
- * Extrai frases de um array de objetos {input, output} para expandir o grafo.
- */
 function episodesToSentences(episodes) {
   const sentences = [];
   for (const ep of episodes) {
@@ -463,7 +409,6 @@ function episodesToSentences(episodes) {
 
 // ---------------------------------------------------------------------------
 // FONTE 3 — Web crawl
-// CORRIGIDO v5: filtro de qualidade mais permissivo, expande vocab
 // ---------------------------------------------------------------------------
 
 async function fetchWebPatterns(db, vocab, maxQueries = 3) {
@@ -475,7 +420,6 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
     return [];
   }
 
-  // Buscar nós provisionais E generated que precisam de expansão
   const snap = await db.collection('nexus_graph')
     .where('confidence', 'in', ['provisional', 'stale', 'generated'])
     .limit(15)
@@ -525,10 +469,9 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
 
     allSentences.push(...relevant);
 
-    // Gerar pares de treino — expandir vocab com tokens novos
     for (const sentence of relevant) {
       const tokens = tokenizeText(sentence);
-      vocab.addTokens(tokens); // sempre adiciona tokens ao vocab
+      vocab.addTokens(tokens);
       const ids = vocab.tokenize(sentence);
       if (ids.length >= 3) allPairs.push(...makeTrainingPairs(ids));
     }
@@ -538,7 +481,6 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
     console.log(`[DATASET] Web (${src}): "${query}" → ${relevant.length} frases`);
   }
 
-  // Expandir grafo com frases coletadas
   if (allSentences.length > 0) {
     try {
       const inserted = await extractAndExpandGraph(db, allSentences, 'web');
@@ -548,10 +490,9 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
     }
   }
 
-  // ── FILTRO DE QUALIDADE v5: mais permissivo e seguro ──────────────────
   const vocabSize = vocab.size;
   const filteredPairs = allPairs.filter(pair => {
-    if (!Array.isArray(pair)) return false; // segurança contra elementos inválidos
+    if (!Array.isArray(pair)) return false;
     const knownTokens = pair.filter(id => typeof id === 'number' && id < vocabSize);
     return knownTokens.length >= 1;
   });
@@ -562,9 +503,8 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
 
   return filteredPairs;
 }
-    
-    
-// ── Serper API ──────────────────────────────────────────────────────────────
+
+// ── APIs de busca ─────────────────────────────────────────────────────────
 
 async function serperSearch(query, apiKey) {
   const https = require('https');
@@ -594,8 +534,6 @@ async function serperSearch(query, apiKey) {
   });
 }
 
-// ── Tavily API ──────────────────────────────────────────────────────────────
-
 async function tavilySearch(query, apiKey) {
   const https = require('https');
   const body  = JSON.stringify({ api_key: apiKey, query, search_depth: 'basic', max_results: 3 });
@@ -619,8 +557,6 @@ async function tavilySearch(query, apiKey) {
     req.end();
   });
 }
-
-// ── Extrator unificado ──────────────────────────────────────────────────────
 
 function extractSentences(response) {
   const raw = [];
@@ -657,13 +593,11 @@ function shuffleInPlace(arr) {
 
 // ---------------------------------------------------------------------------
 // FONTE 4 — Self-play
-// CORRIGIDO v5: fallback para generated, incrementa usage_count
 // ---------------------------------------------------------------------------
 
 async function selfPlayPairs(model, db, vocab, rounds = 10) {
   if (!model.ready) return [];
 
-  // Buscar confirmed + generated (v5: desestagnação)
   let snap = await db.collection('nexus_graph')
     .where('confidence', 'in', ['confirmed', 'generated'])
     .limit(30)
@@ -675,7 +609,7 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
   }
 
   const nodes = [];
-  const nodeRefs = []; // guardar referências para incrementar usage_count
+  const nodeRefs = [];
   snap.forEach(doc => {
     nodes.push(doc.data());
     nodeRefs.push(doc.ref);
@@ -710,13 +644,11 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
 
   if (good > 0) console.log(`[DATASET] Self-play: ${good}/${rounds} gerações aprovadas`);
 
-  // ── Incrementar usage_count nos nós usados ──────────────────────────
   if (usedNodeIds.size > 0) {
     try {
       const batch = db.batch();
       const FV = require('firebase-admin').firestore.FieldValue;
       for (const ref of nodeRefs) {
-        // Só incrementa se o nó foi usado neste ciclo
         const nodeData = nodes.find(n => n.id === ref.id);
         if (nodeData && usedNodeIds.has(nodeData.id)) {
           batch.update(ref, { usage_count: FV.increment(1) });
@@ -726,7 +658,6 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
     } catch (e) { /* fire-and-forget */ }
   }
 
-  // ── Expandir grafo com textos gerados ──────────────────────────────
   if (allGeneratedTexts.length > 0) {
     try {
       const inserted = await extractAndExpandGraph(db, allGeneratedTexts, 'selfplay');
@@ -766,11 +697,9 @@ module.exports = {
   extractSentences,
   serperSearch,
   tavilySearch,
-  // Expansão do grafo
   extractAndExpandGraph,
   episodesToSentences,
   sanitizeNodeId,
   EXPANSION_CONFIG,
-  // Promoção de nós (v5)
   promoteGeneratedNodes,
 };
