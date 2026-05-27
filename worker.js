@@ -340,7 +340,8 @@ async function scheduler() {
     }
 
   } catch (err) {
-    console.error(`${tag} ERRO:`, err.message);
+    console.error(`${tag} ERRO: ${err.message}`);
+    console.error(`${tag} STACK: ${err.stack}`);
   }
 }
 
@@ -358,9 +359,11 @@ async function runMode(mode, ctx = {}) {
 
   switch (mode) {
     case MODE.INTERACTIVE: {
+      // Expandir vocab ANTES de gerar pares — garante que tokenize()
+      // usa o mesmo vocab que o modelo vai ter no momento do treino
+      await maybeExpandVocab(episodes);
       pairs = episodesToPairs(episodes, state.vocab);
       desc  = `${episodes.length} episódios → ${pairs.length} pares`;
-      await maybeExpandVocab(episodes);
       break;
     }
     case MODE.CONSOLIDATION: {
