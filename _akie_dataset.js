@@ -548,11 +548,11 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
     }
   }
 
-  // ── FILTRO DE QUALIDADE v5: mais permissivo ──────────────────────────
+  // ── FILTRO DE QUALIDADE v5: mais permissivo e seguro ──────────────────
   const vocabSize = vocab.size;
   const filteredPairs = allPairs.filter(pair => {
-    // Aceita pares onde pelo menos 1 token é conhecido (antes era 2)
-    const knownTokens = pair.filter(id => id < vocabSize);
+    if (!Array.isArray(pair)) return false; // segurança contra elementos inválidos
+    const knownTokens = pair.filter(id => typeof id === 'number' && id < vocabSize);
     return knownTokens.length >= 1;
   });
 
@@ -562,7 +562,8 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
 
   return filteredPairs;
 }
-
+    
+    
 // ── Serper API ──────────────────────────────────────────────────────────────
 
 async function serperSearch(query, apiKey) {
