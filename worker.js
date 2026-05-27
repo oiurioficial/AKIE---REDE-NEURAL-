@@ -27,6 +27,7 @@ const fs     = require('fs');
 
 const { AKIEModel }              = require('./_nexus_neural');
 const { Vocabulary, tokenizeText } = require('./_akie_vocab');
+const { runBootstrap }             = require('./_akie_bootstrap');
 const {
   fetchUserEpisodes,
   episodesToPairs,
@@ -230,6 +231,15 @@ async function init() {
 
   // Vocabulário
   state.vocab = await loadOrCreateVocab();
+
+  // Bootstrap — garante que o sistema nunca inicie com grafo vazio
+  // Idempotente: só roda uma vez na vida do Firestore
+  const bootstrapped = await runBootstrap(state.db, state.vocab);
+  if (bootstrapped) {
+    // Salvar vocab expandido pelo bootstrap antes de construir o modelo
+    await saveVocab(state.vocab);
+  }
+
   console.log(`[INIT] Vocabulário: ${state.vocab.size} tokens`);
 
   // Modelo
@@ -239,9 +249,13 @@ async function init() {
   if (!loaded) {
     console.log('[INIT] Nenhum modelo encontrado. Construindo novo...');
     await primeVocabulary(state.vocab, state.db);
+    // Re-executar bootstrap de vocab caso primeVocabulary tenha adicionado tokens
     state.model = new AKIEModel(state.vocab);
     state.model.build();
     await state.model.save(CONFIG.modelDir);
+  } else {
+    // Modelo carregado — verificar se vocab cresceu desde o último save
+    await maybeRebuildForVocabGrowth();
   }
 
   await state.db.collection('akie_worker_status').doc('current').set({
@@ -344,9 +358,12 @@ async function runMode(mode, ctx = {}) {
       break;
     }
     case MODE.EXPANSION: {
+      const vocabBefore = state.vocab.size;
       pairs = await fetchWebPatterns(state.db, state.vocab, 3);
       desc  = `web crawl → ${pairs.length} pares`;
-      if (pairs.length > 0) {
+      // Sempre verificar crescimento de vocab, mesmo sem pairs
+      // O fetchWebPatterns adiciona tokens ao vocab independentemente de gerar pares
+      if (state.vocab.size > vocabBefore) {
         await saveVocab(state.vocab);
         await maybeRebuildForVocabGrowth();
       }
@@ -403,9 +420,10 @@ async function maybeExpandVocab(episodes) {
 }
 
 async function maybeRebuildForVocabGrowth() {
-  const curr  = state.vocab.size;
-  const model = state.model.getStats().vocabSize;
-  if (curr > model) {
+  const curr        = state.vocab.size;
+  const embSize     = state.model.getStats().embeddingVocabSize; // tamanho REAL da camada
+  if (curr > embSize) {
+    console.log(`[VOCAB] Expandindo camada de embedding: ${embSize} → ${curr}`);
     await state.model.expandVocabulary(curr);
     state.model.vocab = state.vocab;
   }
