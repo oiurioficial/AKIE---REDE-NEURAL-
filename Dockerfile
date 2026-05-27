@@ -20,10 +20,10 @@ RUN npm install --omit=dev
 COPY . .
 
 # Diretório do modelo (Railway Volume monta aqui)
+# Não apaga dados existentes se o volume já contiver arquivos
 RUN mkdir -p /data/akie_model
 
-# Healthcheck simples via arquivo de status
-HEALTHCHECK --interval=120s --timeout=10s --start-period=30s \
-  CMD node -e "require('fs').statSync('/data/akie_model')" || exit 1
+# Healthcheck removido para evitar reinicializações desnecessárias
+# que apagavam o volume a cada restart
 
 CMD ["node", "worker.js"]
