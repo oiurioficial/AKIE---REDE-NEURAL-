@@ -270,6 +270,7 @@ class AKIEModel {
     this.trainSteps = 0;
     this.ready = false;
     this.embeddingVocabSize = 0;
+    this._expandLock = null;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -549,7 +550,7 @@ class AKIEModel {
    */
   async expandVocabulary(newVocabSize) {
     if (!this.ready) return;
-    if (newVocabSize <= this.vocab.size) return;
+  if (newVocabSize <= this.embeddingVocabSize) return;
 
     console.log(`[AKIE] Reconfigurando dimensões do Transformer: ${this.vocab.size} → ${newVocabSize}`);
 
