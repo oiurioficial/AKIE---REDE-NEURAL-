@@ -1288,7 +1288,7 @@ async function runBootstrap(db, vocab) {
           input:      ep.input,
           output:     ep.output,
           layer:      'bootstrap',
-          feedback:   'positive',   // peso 2x no treinamento
+          feedback:   'positive',
           processed:  false,
           created_at: new Date().toISOString(),
         });
@@ -1344,42 +1344,41 @@ async function runBootstrap(db, vocab) {
   console.log(`[BOOTSTRAP] vocabulário inicial: ${after} tokens (era ${before})`);
 
   // ── Marcar sentinela ──────────────────────────────────────────────────
-await _markBootstrapComplete(db, insertedEpisodes, insertedNodes, after);
+  await _markBootstrapComplete(db, insertedEpisodes, insertedNodes, after);
 
-// 🔥 NOVO: treino direto no modelo
-if (global.akieModel) {
-  console.log('[BOOTSTRAP] Iniciando treino direto no modelo...');
+  // ── Treino inicial com modelo (via callback registrado pelo worker) ──
+  if (typeof global.__akieTrainCallback === 'function') {
+    console.log('[BOOTSTRAP] Iniciando treino direto no modelo...');
+    try {
+      const pairs = [];
 
-  const pairs = [];
+      for (const ep of BOOTSTRAP_EPISODES.slice(0, 500)) {
+        const fullText = `${ep.input} ${ep.output}`;
+        const ids = vocab.tokenize(fullText);
 
-  for (const ep of BOOTSTRAP_EPISODES) {
-    const inputIds  = global.akieModel.vocab.tokenize(ep.input);
-    const outputIds = global.akieModel.vocab.tokenize(ep.output);
+        if (ids.length < 3) continue;
 
-    for (let i = 1; i < outputIds.length; i++) {
-      const x = [
-        ...inputIds,
-        ...outputIds.slice(0, i)
-      ].slice(-global.akieModel.hparams.maxSeqLen);
+        const trainingPairs = makeTrainingPairs(ids);
+        pairs.push(...trainingPairs);
+      }
 
-      const y = outputIds[i];
+      console.log(`[BOOTSTRAP] ${pairs.length} pares gerados para treino`);
 
-      pairs.push({ x, y });
+      if (pairs.length > 0) {
+        await global.__akieTrainCallback(pairs, 3);
+        console.log('[BOOTSTRAP] Treino inicial concluído');
+      } else {
+        console.log('[BOOTSTRAP] Nenhum par válido para treino inicial');
+      }
+    } catch (e) {
+      console.warn('[BOOTSTRAP] Treino inicial falhou (não crítico):', e.message);
     }
+  } else {
+    console.log('[BOOTSTRAP] Callback de treino não registrado — pulando treino inicial');
   }
 
-  console.log(`[BOOTSTRAP] ${pairs.length} pares gerados para treino`);
-
-  await global.akieModel.trainBatch(pairs, 5);
-
-  console.log('[BOOTSTRAP] Treino inicial concluído');
-} else {
-  console.log('[BOOTSTRAP] Modelo não disponível para treino inicial');
+  return true;
 }
-
-return true;
-}
-    
 
 async function _markBootstrapComplete(db, episodes, nodes, vocabSize) {
   await db.collection('akie_worker_status').doc('bootstrap').set({
