@@ -193,11 +193,18 @@ class AKIEModel {
 
       // Inferência
       const inputTensor = tf.tensor2d([padded], [1, padLen], 'int32');
-      const logits = this.model.predict(inputTensor);
+      const rawLogits = this.model.predict(inputTensor);
+
+      // Cast explícito para float32 — tfjs-node pode retornar int32 dependendo
+      // do dtype interno das camadas de embedding quando o input é int32
+      const logits = rawLogits.dtype === 'float32'
+        ? rawLogits
+        : rawLogits.cast('float32');
 
       // Amostragem com temperatura
       const nextId = this._sampleWithTemperature(logits, temp);
       inputTensor.dispose();
+      if (logits !== rawLogits) rawLogits.dispose();
       logits.dispose();
 
       // Parar em EOS
@@ -214,18 +221,27 @@ class AKIEModel {
 
   /**
    * Amostragem com temperatura a partir de logits.
+   * Espera tensor float32 — o cast deve ter sido feito antes de chamar este método.
    * @private
    */
   _sampleWithTemperature(logitsTensor, temperature) {
-    const probs = logitsTensor.dataSync();
+    // dataSync() em float32 retorna Float32Array diretamente
+    // Se por alguma razão ainda for int32, Math.log ainda funciona — mas o cast
+    // no método generate() deve ter resolvido antes de chegar aqui
+    const probs = Array.from(logitsTensor.dataSync());
 
     if (temperature <= 0.01) {
       // Greedy: retorna o token com maior probabilidade
-      return probs.indexOf(Math.max(...probs));
+      let maxIdx = 0;
+      let maxVal = probs[0];
+      for (let i = 1; i < probs.length; i++) {
+        if (probs[i] > maxVal) { maxVal = probs[i]; maxIdx = i; }
+      }
+      return maxIdx;
     }
 
     // Aplicar temperatura: dividir log-probs por temperature e re-normalizar
-    const logProbs = Array.from(probs).map(p => Math.log(Math.max(p, 1e-10)) / temperature);
+    const logProbs = probs.map(p => Math.log(Math.max(p, 1e-10)) / temperature);
     const maxLog = Math.max(...logProbs);
     const exps = logProbs.map(lp => Math.exp(lp - maxLog));
     const sumExps = exps.reduce((a, b) => a + b, 0);
