@@ -365,18 +365,32 @@ class AKIEModel {
     if (!this.ready) throw new Error('Modelo não construído. Chame build() primeiro.');
     if (!pairs || pairs.length === 0) return { loss: null, accuracy: null, steps: 0 };
 
+    // ── Filtro de segurança: descarta tokens que não cabem na embedding atual ──
+    const validPairs = pairs.filter(p => {
+      if (!Array.isArray(p.x)) return false;
+      return p.x.every(id => id < this.embeddingVocabSize) && p.y < this.embeddingVocabSize;
+    });
+
+    if (validPairs.length === 0) {
+      console.warn('[AKIE] Nenhum par válido (tokens fora do vocab do modelo). Pulando treino.');
+      return { loss: null, accuracy: null, steps: 0 };
+    }
+
+    if (validPairs.length < pairs.length) {
+      console.warn(`[AKIE] ${pairs.length - validPairs.length} pares descartados (tokens >= embeddingVocabSize).`);
+    }
+
     // Enriquecimento NLP: se `natural` está disponível, adiciona os pares
     // ao índice TF-IDF para análise posterior de relevância de termos.
-    // Não bloqueia o treino — é fire-and-forget sobre o batch atual.
-    if (NaturalNLP.isReady && pairs.length > 10) {
-      const sample = pairs.slice(0, Math.min(50, pairs.length));
+    if (NaturalNLP.isReady && validPairs.length > 10) {
+      const sample = validPairs.slice(0, Math.min(50, validPairs.length));
       const text = sample.map(p => p.x.filter(id => id > 3).join(' ')).join(' ');
       NaturalNLP.addDocument(text, `batch_${this.trainSteps}`);
     }
 
-    const xs = tf.tensor2d(pairs.map(p => p.x), [pairs.length, this.hparams.maxSeqLen], 'int32');
+    const xs = tf.tensor2d(validPairs.map(p => p.x), [validPairs.length, this.hparams.maxSeqLen], 'int32');
     // FIX: sparseCategoricalCrossentropy no tfjs-node 4.x exige float32 nos labels
-    const ys = tf.tensor1d(pairs.map(p => p.y), 'float32');
+    const ys = tf.tensor1d(validPairs.map(p => p.y), 'float32');
 
     let lastLoss = null;
     let lastAcc = null;
@@ -391,13 +405,13 @@ class AKIEModel {
 
       lastLoss = history.history.loss[history.history.loss.length - 1];
       lastAcc  = (history.history.acc || history.history.accuracy)[history.history.loss.length - 1];
-      this.trainSteps += pairs.length * epochs;
+      this.trainSteps += validPairs.length * epochs;
     } finally {
       xs.dispose();
       ys.dispose();
     }
 
-    return { loss: lastLoss, accuracy: lastAcc, steps: this.trainSteps, samples: pairs.length };
+    return { loss: lastLoss, accuracy: lastAcc, steps: this.trainSteps, samples: validPairs.length };
   }
 
   // ─────────────────────────────────────────────────────────────────────────
