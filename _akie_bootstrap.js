@@ -1,22 +1,17 @@
 /**
- * _akie_bootstrap.js  —  Bootstrap de Conhecimento AKIE v2
- *
- * Dataset expandido: 1.500+ pares input/output
- * Inclui: conversação, variações, técnico, multi-turno, edge cases
- * Estratégia: máxima diversidade + relevância para IA/ML
+ * _akie_bootstrap.js  —  Bootstrap de Conhecimento AKIE
  *
  * Garante que o sistema nunca inicie com grafo vazio.
  * Roda apenas uma vez (idempotente via documento sentinela no Firestore).
+ *
+ * Popula:
+ *   nexus_episodes  → 300+ pares input/output para treino INTERACTIVE
+ *   nexus_graph     → nós semânticos base para treino CONSOLIDATION
+ *   akie_vocab      → vocabulário mínimo de 500+ tokens PT-BR
  */
 
 const { tokenizeText } = require('./_akie_vocab');
 
-// ---------------------------------------------------------------------------
-// BOOTSTRAP_EPISODES — 1.500+ pares input/output PT-BR
-// Organizado por domínio com múltiplas variações
-// ---------------------------------------------------------------------------
-
-const BOOTSTRAP_EPISODES = [
   // ════════════════════════════════════════════════════════════════════════════
   // SEÇÃO 1: Saudações e Conversação (30 pares)
   // ════════════════════════════════════════════════════════════════════════════
