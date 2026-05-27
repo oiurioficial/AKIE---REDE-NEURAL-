@@ -43,6 +43,9 @@ class AKIEModel {
     this.optimizer = null;
     this.trainSteps = 0;
     this.ready = false;
+    // Tamanho real da camada de embedding — diferente de vocab.size quando
+    // o vocabulário cresce em runtime mas o modelo ainda não foi expandido
+    this.embeddingVocabSize = 0;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -97,6 +100,7 @@ class AKIEModel {
     });
 
     this.ready = true;
+    this.embeddingVocabSize = vocabSize; // registrar tamanho real da camada de embedding
     console.log(`[AKIE] Modelo construído. Parâmetros: ${this.model.countParams().toLocaleString()}`);
     console.log(`[AKIE] Vocabulário: ${vocabSize} tokens`);
     return this;
@@ -193,10 +197,10 @@ class AKIEModel {
 
       // Inferência
       const inputTensor = tf.tensor2d([padded], [1, padLen], 'int32');
-      const rawLogits = this.model.predict(inputTensor);
+      const rawLogits   = this.model.predict(inputTensor);
 
-      // Cast explícito para float32 — tfjs-node pode retornar int32 dependendo
-      // do dtype interno das camadas de embedding quando o input é int32
+      // Cast explícito para float32 — tfjs-node retorna int32 quando o input
+      // da camada de embedding é int32, causando erro em floor() no dataSync
       const logits = rawLogits.dtype === 'float32'
         ? rawLogits
         : rawLogits.cast('float32');
@@ -220,32 +224,29 @@ class AKIEModel {
   }
 
   /**
-   * Amostragem com temperatura a partir de logits.
-   * Espera tensor float32 — o cast deve ter sido feito antes de chamar este método.
+   * Amostragem com temperatura a partir de logits float32.
+   * Cast deve ter sido feito antes de chamar este método.
    * @private
    */
   _sampleWithTemperature(logitsTensor, temperature) {
-    // dataSync() em float32 retorna Float32Array diretamente
-    // Se por alguma razão ainda for int32, Math.log ainda funciona — mas o cast
-    // no método generate() deve ter resolvido antes de chegar aqui
+    // Float32Array.indexOf não existe — usar Array.from() para converter
     const probs = Array.from(logitsTensor.dataSync());
 
     if (temperature <= 0.01) {
-      // Greedy: retorna o token com maior probabilidade
+      // Greedy: loop linear é mais seguro que Math.max(...probs) para vocabs grandes
       let maxIdx = 0;
-      let maxVal = probs[0];
       for (let i = 1; i < probs.length; i++) {
-        if (probs[i] > maxVal) { maxVal = probs[i]; maxIdx = i; }
+        if (probs[i] > probs[maxIdx]) maxIdx = i;
       }
       return maxIdx;
     }
 
     // Aplicar temperatura: dividir log-probs por temperature e re-normalizar
     const logProbs = probs.map(p => Math.log(Math.max(p, 1e-10)) / temperature);
-    const maxLog = Math.max(...logProbs);
-    const exps = logProbs.map(lp => Math.exp(lp - maxLog));
-    const sumExps = exps.reduce((a, b) => a + b, 0);
-    const scaled = exps.map(e => e / sumExps);
+    const maxLog   = Math.max(...logProbs);
+    const exps     = logProbs.map(lp => Math.exp(lp - maxLog));
+    const sumExps  = exps.reduce((a, b) => a + b, 0);
+    const scaled   = exps.map(e => e / sumExps);
 
     // Amostragem multinomial
     const rand = Math.random();
@@ -316,8 +317,15 @@ class AKIEModel {
         this.trainSteps = meta.trainSteps || 0;
       }
 
+      // Inferir embeddingVocabSize a partir da camada de embedding carregada
+      try {
+        const embLayer = this.model.getLayer('embedding');
+        this.embeddingVocabSize = embLayer.getWeights()[0].shape[0];
+      } catch(e) {
+        this.embeddingVocabSize = this.vocab.size;
+      }
       this.ready = true;
-      console.log(`[AKIE] Modelo carregado de ${dir} (steps: ${this.trainSteps})`);
+      console.log(`[AKIE] Modelo carregado de ${dir} (steps: ${this.trainSteps}, embVocab: ${this.embeddingVocabSize})`);
       return true;
 
     } catch (err) {
@@ -380,6 +388,7 @@ class AKIEModel {
 
     this.model.setWeights(updatedWeights);
     oldWeights.forEach(w => w.dispose());
+    this.embeddingVocabSize = newVocabSize;
     console.log(`[AKIE] Vocabulário expandido com sucesso.`);
   }
 
@@ -390,6 +399,7 @@ class AKIEModel {
     return {
       ready: this.ready,
       vocabSize: this.vocab.size,
+      embeddingVocabSize: this.embeddingVocabSize, // tamanho REAL da camada
       trainSteps: this.trainSteps,
       parameters: this.ready ? this.model.countParams() : 0,
       hparams: this.hparams,
