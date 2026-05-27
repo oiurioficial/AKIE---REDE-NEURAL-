@@ -59,10 +59,11 @@ class AKIEModel {
     const input = tf.input({ shape: [maxSeqLen], dtype: 'int32', name: 'context' });
 
     // Embedding: converte token IDs em vetores densos
+    // maskZero removido — tfjs-node propaga a máscara como int32 e quebra
+    // a operação floor() internamente no LSTM com input dtype int32
     const embedding = tf.layers.embedding({
       inputDim: vocabSize,
       outputDim: embDim,
-      maskZero: true,   // ignora padding no LSTM
       name: 'embedding',
     }).apply(input);
 
@@ -342,18 +343,24 @@ class AKIEModel {
    */
   async expandVocabulary(newVocabSize) {
     if (!this.ready) return;
-    if (newVocabSize <= this.vocab.size) return;
+    // Comparar contra embeddingVocabSize (tamanho REAL da camada),
+    // não vocab.size — que já cresceu antes desta chamada ser feita
+    if (newVocabSize <= this.embeddingVocabSize) return;
 
-    console.log(`[AKIE] Expandindo vocabulário: ${this.vocab.size} → ${newVocabSize}`);
+    console.log(`[AKIE] Expandindo vocabulário: ${this.embeddingVocabSize} → ${newVocabSize}`);
 
     // Salvar pesos existentes
     const oldWeights = this.model.getWeights();
-    const oldVocabSize = this.vocab.size;
+    const oldEmbSize = this.embeddingVocabSize;
 
-    // Rebuild com novo tamanho
-    const oldVocab = this.vocab;
-    this.vocab = { ...oldVocab, size: newVocabSize }; // temporário para build
+    // Rebuild com novo tamanho — substituir vocab.size temporariamente
+    // sem mutar o objeto real (que é state.vocab compartilhado)
+    const realVocab = this.vocab;
+    this.vocab = Object.create(realVocab, {
+      size: { value: newVocabSize, writable: false },
+    });
     this.build();
+    this.vocab = realVocab; // restaurar referência real
 
     // Copiar pesos das camadas que não mudaram
     const newWeights = this.model.getWeights();
@@ -364,17 +371,18 @@ class AKIEModel {
       const oldShape = oldW.shape;
       const newShape = w.shape;
 
-      // Se shapes são iguais, copiar diretamente
+      // Shapes iguais → copiar diretamente (LSTM, Dense intermediário)
       if (JSON.stringify(oldShape) === JSON.stringify(newShape)) {
         return oldW;
       }
 
-      // Se é a camada de embedding ou output (primeira dimensão expandiu)
-      if (oldShape.length === 2 && newShape[0] > oldShape[0]) {
+      // Embedding [vocabSize, embDim] ou Output [hiddenSize, vocabSize] —
+      // primeira ou segunda dimensão expandiu
+      if (oldShape.length === 2 && (newShape[0] > oldShape[0] || newShape[1] > oldShape[1])) {
         const oldData = oldW.dataSync();
-        const newData = w.dataSync(); // inicializado aleatoriamente
-        // Copiar pesos dos tokens antigos
-        const merged = new Float32Array(newData);
+        const newData = w.dataSync();
+        const merged  = new Float32Array(newData); // inicializado aleatoriamente
+        // Copiar apenas a região dos tokens antigos
         for (let r = 0; r < oldShape[0]; r++) {
           for (let c = 0; c < oldShape[1]; c++) {
             merged[r * newShape[1] + c] = oldData[r * oldShape[1] + c];
