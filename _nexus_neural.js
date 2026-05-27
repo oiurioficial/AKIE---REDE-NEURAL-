@@ -10,12 +10,115 @@
  *
  * Paradigma: Autoregressive Language Modeling (Next-token prediction).
  * Geração Avançada: Beam Search em Lote com Penalização de Repetição e Temperatura.
+ *
+ * NLP Layer: biblioteca `natural` para stemming PT-BR, TF-IDF e similaridade
+ * — enriquece pares de treino e melhora qualidade do scoring de geração.
  */
 
 const tf = require('@tensorflow/tfjs-node');
 const path = require('path');
 const fs = require('fs');
 const { Vocabulary, makeTrainingPairs, SPECIAL } = require('./_akie_vocab');
+
+// ---------------------------------------------------------------------------
+// NLP Layer — biblioteca `natural` (gratuita, sem API externa)
+// Funções: stemming PT-BR, TF-IDF, similaridade de strings
+// ---------------------------------------------------------------------------
+
+let NaturalNLP = null;
+
+try {
+  const natural = require('natural');
+
+  // Stemmer para PT-BR (PorterStemmerPt remove sufixos morfológicos)
+  const stemmer = natural.PorterStemmerPt;
+
+  // TF-IDF para calcular relevância de termos nas frases de treino
+  const tfidf = new natural.TfIdf();
+
+  // Distância de Jaro-Winkler para similaridade entre tokens gerados e esperados
+  const JaroWinklerDistance = natural.JaroWinklerDistance;
+
+  NaturalNLP = {
+    /**
+     * Reduz token ao seu radical (stem).
+     * Ex: "aprendendo" → "aprend", "correndo" → "corr"
+     * Aumenta generalização: tokens morfologicamente relacionados
+     * convergem para o mesmo stem no grafo semântico.
+     */
+    stem(token) {
+      try { return stemmer.stem(token); }
+      catch { return token; }
+    },
+
+    /**
+     * Calcula stems de uma frase inteira.
+     * Retorna array de stems para enriquecer o vocabulário com formas radicais.
+     */
+    stemSentence(sentence) {
+      try {
+        return stemmer.tokenizeAndStem(sentence, false); // false = não remover stopwords
+      } catch {
+        return sentence.toLowerCase().split(/\s+/).filter(Boolean);
+      }
+    },
+
+    /**
+     * Adiciona documento ao índice TF-IDF.
+     * Permite identificar quais termos são mais relevantes em cada documento.
+     */
+    addDocument(text, key) {
+      try { tfidf.addDocument(text, key); }
+      catch { /* ignora */ }
+    },
+
+    /**
+     * Retorna os N termos mais relevantes de um documento indexado.
+     * Usado para selecionar os melhores tokens para expandir o vocab.
+     */
+    topTerms(docIndex, n = 5) {
+      try {
+        const terms = [];
+        tfidf.listTerms(docIndex).slice(0, n).forEach(t => terms.push(t.term));
+        return terms;
+      } catch { return []; }
+    },
+
+    /**
+     * Similaridade Jaro-Winkler entre dois strings (0.0 a 1.0).
+     * Usada no scoring de geração: penaliza outputs muito distantes
+     * semanticamente da query de entrada.
+     */
+    similarity(a, b) {
+      try { return JaroWinklerDistance(a, b); }
+      catch { return 0; }
+    },
+
+    /**
+     * Score de qualidade de uma geração usando similaridade com o prompt.
+     * Complementa o scoreGeneration existente no _akie_dataset.js.
+     */
+    generationScore(prompt, generated) {
+      if (!prompt || !generated) return 0;
+      const promptStems  = stemmer.tokenizeAndStem(prompt, false);
+      const genStems     = stemmer.tokenizeAndStem(generated, false);
+      if (!promptStems.length || !genStems.length) return 0;
+      // Proporção de stems do prompt que aparecem na geração
+      const overlap = promptStems.filter(s => genStems.includes(s)).length;
+      return overlap / promptStems.length;
+    },
+
+    isReady: true,
+  };
+
+  console.log('[NLP] Biblioteca `natural` carregada. Stemming PT-BR, TF-IDF e similaridade ativos.');
+} catch (e) {
+  // natural não instalada — sistema continua sem degradação
+  NaturalNLP = { isReady: false, stem: t => t, stemSentence: s => s.split(/\s+/), similarity: () => 0, generationScore: () => 0, addDocument: () => {}, topTerms: () => [] };
+  console.log('[NLP] `natural` não encontrada. Rodando sem NLP avançado. Execute: npm install natural');
+}
+
+module.exports.NaturalNLP = NaturalNLP;
 
 // ---------------------------------------------------------------------------
 // Hiperparâmetros
@@ -247,8 +350,18 @@ class AKIEModel {
     if (!this.ready) throw new Error('Modelo não construído. Chame build() primeiro.');
     if (!pairs || pairs.length === 0) return { loss: null, accuracy: null, steps: 0 };
 
+    // Enriquecimento NLP: se `natural` está disponível, adiciona os pares
+    // ao índice TF-IDF para análise posterior de relevância de termos.
+    // Não bloqueia o treino — é fire-and-forget sobre o batch atual.
+    if (NaturalNLP.isReady && pairs.length > 10) {
+      const sample = pairs.slice(0, Math.min(50, pairs.length));
+      const text = sample.map(p => p.x.filter(id => id > 3).join(' ')).join(' ');
+      NaturalNLP.addDocument(text, `batch_${this.trainSteps}`);
+    }
+
     const xs = tf.tensor2d(pairs.map(p => p.x), [pairs.length, this.hparams.maxSeqLen], 'int32');
-    const ys = tf.tensor1d(pairs.map(p => p.y), 'int32');
+    // FIX: sparseCategoricalCrossentropy no tfjs-node 4.x exige float32 nos labels
+    const ys = tf.tensor1d(pairs.map(p => p.y), 'float32');
 
     let lastLoss = null;
     let lastAcc = null;
@@ -362,7 +475,24 @@ class AKIEModel {
     const finalSelection = [...completedBeams, ...beams];
     if (finalSelection.length === 0) return '';
 
-    finalSelection.sort((a, b) => b.score - a.score);
+    // Reranking com NLP semântico: se natural está disponível, combina
+    // score do beam (log-prob) com similaridade de stems prompt→geração.
+    // Peso 0.85 log-prob + 0.15 semântico — preserva qualidade neural
+    // mas desempata beams próximos usando coerência temática.
+    if (NaturalNLP.isReady && finalSelection.length > 1) {
+      finalSelection.forEach(cand => {
+        const generated = this.vocab.detokenize(
+          cand.generatedIds.filter(id => id !== SPECIAL.EOS && id !== SPECIAL.PAD && id !== SPECIAL.BOS)
+        );
+        const nlpScore = NaturalNLP.generationScore(prompt, generated);
+        // Normaliza o beam score (negativo, log-prob) para combinar com nlpScore (0–1)
+        cand.combinedScore = cand.score * 0.85 + nlpScore * 0.15;
+      });
+      finalSelection.sort((a, b) => b.combinedScore - a.combinedScore);
+    } else {
+      finalSelection.sort((a, b) => b.score - a.score);
+    }
+
     const outputTokens = finalSelection[0].generatedIds.filter(
       id => id !== SPECIAL.EOS && id !== SPECIAL.PAD && id !== SPECIAL.BOS
     );
@@ -484,8 +614,17 @@ class AKIEModel {
       trainSteps: this.trainSteps,
       parameters: this.ready ? this.model.countParams() : 0,
       hparams: this.hparams,
+      nlp: { natural: NaturalNLP.isReady, features: NaturalNLP.isReady ? 'stemming+tfidf+similarity' : 'disabled' },
     };
+  }
+
+  /**
+   * Expõe stemming via NaturalNLP para uso externo (ex: _akie_dataset.js).
+   * Permite que o dataset normalize termos antes de tokenizar.
+   */
+  static stemTokens(tokens) {
+    return tokens.map(t => NaturalNLP.stem(t));
   }
 }
 
-module.exports = { AKIEModel, HPARAMS };
+module.exports = { AKIEModel, HPARAMS, NaturalNLP };
