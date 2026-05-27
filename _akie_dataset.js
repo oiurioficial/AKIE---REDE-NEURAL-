@@ -2,15 +2,16 @@
  * _akie_dataset.js
  *
  * Pipeline de dados para treino contínuo do AKIE.
- * Quatro fontes independentes — o worker nunca fica sem dados.
  *
- *  FONTE 1 — Episódios reais (usuário interagindo)
- *  FONTE 2 — Grafo semântico (relações do Firestore → frases)
- *  FONTE 3 — Web crawl via Tavily (quando há lacunas no grafo)
- *  FONTE 4 — Self-play (modelo gera, avalia, treina nos melhores)
+ * CORREÇÕES v2:
+ *   - nexus_nodes → nexus_graph (alinhado com o motor NEXUS)
+ *   - confirmed === true → confidence === 'confirmed'
+ *   - Campo weight → usar confidence + relations[].weight
+ *   - fetchGraphSentences usa nexus_graph corretamente
+ *   - fetchWebPatterns usa nexus_graph com filtro por score baixo
  */
 
-const { tokenizeText, makeTrainingPairs, SPECIAL } = require('./_akie_vocab');
+const { tokenizeText, makeTrainingPairs } = require('./_akie_vocab');
 
 // ---------------------------------------------------------------------------
 // FONTE 1 — Episódios reais de interação
@@ -18,7 +19,7 @@ const { tokenizeText, makeTrainingPairs, SPECIAL } = require('./_akie_vocab');
 
 /**
  * Busca episódios não processados do Firestore.
- * Marca como processed=true após extrair.
+ * processed=false → ainda não foram usados para treino.
  */
 async function fetchUserEpisodes(db, limit = 50) {
   const snap = await db.collection('nexus_episodes')
@@ -30,17 +31,23 @@ async function fetchUserEpisodes(db, limit = 50) {
   if (snap.empty) return [];
 
   const episodes = [];
-  const batch = db.batch();
+  const batch    = db.batch();
 
   snap.forEach(doc => {
     const d = doc.data();
-    episodes.push({
-      input:    d.input    || d.user_message || '',
-      output:   d.output   || d.system_message || '',
-      feedback: d.feedback || null,  // 'positive' | 'negative' | null
-      layer:    d.layer    || null,
-    });
-    // Marcar como processado
+    // Normaliza campos — o motor salva como input/response, o worker precisa input/output
+    const input  = d.input  || d.user_message    || '';
+    const output = d.response || d.output || d.system_message || '';
+
+    if (input && output) {
+      episodes.push({
+        id:       doc.id,
+        input,
+        output,
+        feedback: d.feedback || null,
+        layer:    d.layer    || null,
+      });
+    }
     batch.update(doc.ref, { processed: true, processed_at: new Date().toISOString() });
   });
 
@@ -50,46 +57,40 @@ async function fetchUserEpisodes(db, limit = 50) {
 
 /**
  * Converte episódios em pares de treino.
- * Formato: "INPUT: <texto> RESPOSTA: <texto>"
- * Feedback positivo → peso 2x (reforço).
- * Feedback negativo → descartado.
+ * Feedback positivo → peso 2x. Negativo → descartado.
  */
 function episodesToPairs(episodes, vocab) {
   const allPairs = [];
 
   for (const ep of episodes) {
-    if (ep.feedback === 'negative') continue; // não treinar em exemplos ruins
+    if (ep.feedback === 'negative') continue;
+    if (!ep.input || !ep.output)   continue;
 
-    if (!ep.input || !ep.output) continue;
-
-    // Construir sequência completa: contexto + resposta
     const fullText = `${ep.input} ${ep.output}`;
-    const ids = vocab.tokenize(fullText);
-    const pairs = makeTrainingPairs(ids, vocab /* maxSeqLen via vocab config */);
+    const ids      = vocab.tokenize(fullText);
+    const pairs    = makeTrainingPairs(ids);
+    const weight   = ep.feedback === 'positive' ? 2 : 1;
 
-    const weight = ep.feedback === 'positive' ? 2 : 1;
-    for (let i = 0; i < weight; i++) {
-      allPairs.push(...pairs);
-    }
+    for (let i = 0; i < weight; i++) allPairs.push(...pairs);
   }
 
   return allPairs;
 }
 
 // ---------------------------------------------------------------------------
-// FONTE 2 — Síntese a partir do grafo semântico
+// FONTE 2 — Grafo semântico NEXUS → frases de treino
+// CORRIGIDO: usa nexus_graph + confidence === 'confirmed'
 // ---------------------------------------------------------------------------
 
 /**
- * Busca nós confirmados do Firestore e converte em frases de treino.
+ * Busca nós confirmados do nexus_graph e converte em frases.
  *
- * Cada relação no grafo vira uma frase:
- *   ola --[e_tipo]--> saudacao  → "ola é um tipo de saudacao"
- *   interno --[significa]--> de_dentro → "interno significa de dentro"
+ * Estrutura do nó em nexus_graph:
+ *   { id, label, confidence, relations: [{type, target, weight}], contexts[], verbs[] }
  */
 async function fetchGraphSentences(db, limit = 200) {
-  const snap = await db.collection('nexus_nodes')
-    .where('confirmed', '==', true)
+  const snap = await db.collection('nexus_graph')
+    .where('confidence', '==', 'confirmed')
     .limit(limit)
     .get();
 
@@ -97,76 +98,112 @@ async function fetchGraphSentences(db, limit = 200) {
 
   snap.forEach(doc => {
     const node = doc.data();
-    const rels = (node.relations || []).filter(r => r.confirmed && r.weight >= 0.70);
+    const label = node.label || node.id.replace(/_/g, ' ');
+
+    // Relações com peso significativo
+    const rels = (node.relations || []).filter(r => r.weight >= 0.60);
 
     for (const rel of rels) {
-      const sentence = relationToSentence(
-        node.label || node.id,
-        rel.type,
-        rel.target.replace(/_/g, ' ')
-      );
+      const target   = (rel.target || '').replace(/_/g, ' ');
+      const sentence = relationToSentence(label, rel.type, target);
       if (sentence) sentences.push(sentence);
     }
+
+    // Contextos como frases simples
+    (node.contexts || []).forEach(ctx => {
+      if (ctx && ctx.length > 2) {
+        sentences.push(`${label} aparece em ${ctx.replace(/_/g, ' ')}`);
+      }
+    });
+
+    // Verbos como frases simples
+    (node.verbs || []).slice(0, 2).forEach(verb => {
+      if (verb && verb.length > 3) {
+        sentences.push(`${label} ${verb.replace(/_/g, ' ')}`);
+      }
+    });
   });
 
   return sentences;
 }
 
 /**
- * Converte tipo de relação em frase natural.
+ * Converte tipo de relação NEXUS em frase natural PT-BR.
+ * Cobre todos os tipos definidos em REL_TYPE_VERBS do _nexus_seed.js.
  */
 function relationToSentence(source, relType, target) {
   const s = source.replace(/_/g, ' ');
   const t = target.replace(/_/g, ' ');
+  if (!s || !t) return null;
 
   const templates = {
-    'e_tipo':       [`${s} é um tipo de ${t}`, `${s} é ${t}`],
-    'significa':    [`${s} significa ${t}`, `o significado de ${s} é ${t}`],
-    'serve_para':   [`${s} serve para ${t}`, `${s} é usado para ${t}`],
-    'usado_para':   [`${s} é usado para ${t}`],
-    'representa':   [`${s} representa ${t}`],
-    'parte_de':     [`${s} faz parte de ${t}`, `${s} é parte de ${t}`],
-    'similar_a':    [`${s} é similar a ${t}`, `${s} é parecido com ${t}`],
-    'descrito_como':[`${s} pode ser descrito como ${t}`],
+    'e_tipo':         [`${s} é um tipo de ${t}`, `${s} é ${t}`],
+    'gera':           [`${s} gera ${t}`, `${s} produz ${t}`],
+    'requer':         [`${s} requer ${t}`, `${s} precisa de ${t}`],
+    'relacionado_a':  [`${s} está relacionado a ${t}`, `${s} aparece com ${t}`],
+    'usa':            [`${s} usa ${t}`, `${s} aplica ${t}`],
+    'implica':        [`${s} implica ${t}`, `${s} sugere ${t}`],
+    'contrasta':      [`${s} contrasta com ${t}`],
+    'parte_de':       [`${s} faz parte de ${t}`, `${s} é componente de ${t}`],
+    'define':         [`${s} define ${t}`, `${s} determina ${t}`],
+    'influencia':     [`${s} influencia ${t}`, `${s} afeta ${t}`],
+    'valida':         [`${s} valida ${t}`, `${s} confirma ${t}`],
+    'resolve':        [`${s} resolve ${t}`, `${s} soluciona ${t}`],
+    'compoe':         [`${s} compõe ${t}`, `${s} forma ${t}`],
+    'depende_de':     [`${s} depende de ${t}`, `${s} se baseia em ${t}`],
+    'facilita':       [`${s} facilita ${t}`],
+    'reduz':          [`${s} reduz ${t}`, `${s} diminui ${t}`],
+    'melhora':        [`${s} melhora ${t}`, `${s} aprimora ${t}`],
+    'segue_de':       [`${s} decorre de ${t}`, `${s} vem de ${t}`],
+    'precede':        [`${s} precede ${t}`, `${s} vem antes de ${t}`],
+    'guia':           [`${s} guia ${t}`, `${s} orienta ${t}`],
+    'organiza':       [`${s} organiza ${t}`, `${s} estrutura ${t}`],
+    'ilustra':        [`${s} ilustra ${t}`, `${s} exemplifica ${t}`],
+    'conecta':        [`${s} conecta ${t}`, `${s} liga ${t}`],
+    'expressa':       [`${s} expressa ${t}`, `${s} representa ${t}`],
+    'clarifica':      [`${s} clarifica ${t}`, `${s} esclarece ${t}`],
+    'ajusta':         [`${s} ajusta ${t}`, `${s} corrige ${t}`],
+    'fortalece':      [`${s} fortalece ${t}`, `${s} reforça ${t}`],
+    'afeta':          [`${s} afeta ${t}`, `${s} impacta ${t}`],
+    'constroi':       [`${s} constrói ${t}`, `${s} desenvolve ${t}`],
+    'indica':         [`${s} indica ${t}`, `${s} sinaliza ${t}`],
+    'emerge_de':      [`${s} emerge de ${t}`, `${s} surge de ${t}`],
+    'permite':        [`${s} permite ${t}`, `${s} possibilita ${t}`],
+    'bloqueia':       [`${s} bloqueia ${t}`, `${s} impede ${t}`],
+    'suporta':        [`${s} suporta ${t}`, `${s} sustenta ${t}`],
+    'tem':            [`${s} tem ${t}`, `${s} possui ${t}`],
+    'mede':           [`${s} mede ${t}`, `${s} avalia ${t}`],
+    'comunica':       [`${s} comunica ${t}`, `${s} transmite ${t}`],
+    'resulta_de':     [`${s} resulta de ${t}`, `${s} vem de ${t}`],
+    'dificulta':      [`${s} dificulta ${t}`, `${s} complica ${t}`],
+    'explica':        [`${s} explica ${t}`, `${s} justifica ${t}`],
+    'construido_por': [`${s} é construído por ${t}`, `${s} é formado por ${t}`],
+    'expresso_por':   [`${s} é expresso por ${t}`, `${s} é representado por ${t}`],
   };
 
   const options = templates[relType];
-  if (!options) return null;
+  if (!options) return `${s} ${relType.replace(/_/g, ' ')} ${t}`;
 
-  // Alterna entre variações para diversificar o dataset
+  // Alterna entre variações para diversificar
   return options[Math.floor(Math.random() * options.length)];
 }
 
-/**
- * Converte frases do grafo em pares de treino.
- */
 function graphSentencesToPairs(sentences, vocab) {
   const allPairs = [];
-
   for (const sentence of sentences) {
     if (!sentence) continue;
     const ids = vocab.tokenize(sentence);
     if (ids.length < 3) continue;
     allPairs.push(...makeTrainingPairs(ids));
   }
-
   return allPairs;
 }
 
 // ---------------------------------------------------------------------------
-// FONTE 3 — Web crawl (Serper + Tavily em paralelo, fallback automático)
+// FONTE 3 — Web crawl
+// CORRIGIDO: usa nexus_graph, filtra por nós com usage_count baixo
 // ---------------------------------------------------------------------------
 
-/**
- * Busca texto da web sobre conceitos com baixa cobertura no grafo.
- * Usa Serper (Google) e Tavily em paralelo — mais resultados, mais diversidade.
- * Extrai PADRÕES relacionais — não armazena texto bruto.
- *
- * Prioridade de busca:
- *   1. Serper (Google Search) — snippets ricos, knowledge graph quando disponível
- *   2. Tavily — fallback ou complemento
- *   Se nenhuma chave disponível → pula Modo EXPANSION silenciosamente
- */
 async function fetchWebPatterns(db, vocab, maxQueries = 3) {
   const serperKey = process.env.SERPER_API_KEY;
   const tavilyKey = process.env.TAVILY_API_KEY;
@@ -176,86 +213,74 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
     return [];
   }
 
-  // Encontrar nós com peso baixo (precisam de mais conhecimento)
-  const snap = await db.collection('nexus_nodes')
-    .where('weight', '<', 0.65)
+  // Nós com menor uso (precisam de mais conhecimento)
+  // CORRIGIDO: nexus_graph, sem filtro por campo 'weight' (não existe no schema)
+  const snap = await db.collection('nexus_graph')
+    .where('confidence', 'in', ['provisional', 'stale'])
     .limit(15)
     .get();
 
-  if (snap.empty) return [];
+  if (snap.empty) {
+    // Fallback: pegar qualquer nó para expandir vocabulário
+    const allSnap = await db.collection('nexus_graph').limit(10).get();
+    if (allSnap.empty) return [];
+    const candidates = [];
+    allSnap.forEach(doc => {
+      const d = doc.data();
+      if (d.id) candidates.push(d.id.replace(/_/g, ' '));
+    });
+    return runWebQueries(candidates.slice(0, maxQueries), vocab, serperKey, tavilyKey);
+  }
 
   const candidates = [];
   snap.forEach(doc => {
     const d = doc.data();
-    if (d.id && d.id.length > 2) candidates.push(d.id.replace(/_/g, ' '));
+    if (d.id) candidates.push(d.id.replace(/_/g, ' '));
   });
 
-  if (candidates.length === 0) return [];
-
-  // Embaralhar para não buscar sempre os mesmos nós
   shuffleInPlace(candidates);
-  const queries = candidates.slice(0, maxQueries);
+  return runWebQueries(candidates.slice(0, maxQueries), vocab, serperKey, tavilyKey);
+}
+
+async function runWebQueries(queries, vocab, serperKey, tavilyKey) {
   const allPairs = [];
 
   for (const query of queries) {
-    const sentences = [];
-
-    // Buscar em paralelo quando ambas as chaves disponíveis
     const searchPromises = [];
-    if (serperKey) searchPromises.push(
-      serperSearch(query, serperKey).catch(e => {
-        console.error(`[DATASET] Serper falhou "${query}":`, e.message);
-        return null;
-      })
-    );
-    if (tavilyKey) searchPromises.push(
-      tavilySearch(query, tavilyKey).catch(e => {
-        console.error(`[DATASET] Tavily falhou "${query}":`, e.message);
-        return null;
-      })
-    );
+    if (serperKey) searchPromises.push(serperSearch(query, serperKey).catch(() => null));
+    if (tavilyKey) searchPromises.push(tavilySearch(query, tavilyKey).catch(() => null));
 
-    const results = await Promise.all(searchPromises);
+    const results  = await Promise.all(searchPromises);
+    const sentences = [];
 
     for (const result of results) {
       if (!result) continue;
       sentences.push(...extractSentences(result));
     }
 
-    // Deduplicar frases (Serper e Tavily podem retornar as mesmas)
-    const unique = [...new Map(sentences.map(s => [s.toLowerCase(), s])).values()];
-
-    const relevant = unique
-      .filter(s => s.length > 15 && s.length < 200)
-      .slice(0, 30); // máximo 30 frases por query
+    const unique   = [...new Map(sentences.map(s => [s.toLowerCase(), s])).values()];
+    const relevant = unique.filter(s => s.length > 15 && s.length < 200).slice(0, 30);
 
     for (const sentence of relevant) {
       const tokens = tokenizeText(sentence);
       vocab.addTokens(tokens);
       const ids = vocab.tokenize(sentence);
-      if (ids.length >= 3) {
-        allPairs.push(...makeTrainingPairs(ids));
-      }
+      if (ids.length >= 3) allPairs.push(...makeTrainingPairs(ids));
     }
 
-    const sources = [serperKey ? 'Serper' : null, tavilyKey ? 'Tavily' : null]
+    const src = [serperKey ? 'Serper' : null, tavilyKey ? 'Tavily' : null]
       .filter(Boolean).join('+');
-    console.log(`[DATASET] Web (${sources}): "${query}" → ${relevant.length} frases`);
+    console.log(`[DATASET] Web (${src}): "${query}" → ${relevant.length} frases`);
   }
 
   return allPairs;
 }
 
-// ── Serper API (Google Search) ───────────────────────────────────────────────
+// ── Serper API ──────────────────────────────────────────────────────────────
 
 async function serperSearch(query, apiKey) {
   const https = require('https');
-  const body = JSON.stringify({
-    q: query,
-    gl: 'br',      // resultados em PT-BR
-    hl: 'pt-br',
-    num: 5,
-  });
+  const body  = JSON.stringify({ q: query, gl: 'br', hl: 'pt-br', num: 5 });
 
   return new Promise((resolve, reject) => {
     const req = https.request({
@@ -267,9 +292,9 @@ async function serperSearch(query, apiKey) {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
-    }, (res) => {
+    }, res => {
       let data = '';
-      res.on('data', chunk => data += chunk);
+      res.on('data', c => data += c);
       res.on('end', () => {
         try { resolve({ _source: 'serper', ...JSON.parse(data) }); }
         catch (e) { reject(e); }
@@ -281,30 +306,21 @@ async function serperSearch(query, apiKey) {
   });
 }
 
-// ── Tavily API ───────────────────────────────────────────────────────────────
+// ── Tavily API ──────────────────────────────────────────────────────────────
 
 async function tavilySearch(query, apiKey) {
   const https = require('https');
-  const body = JSON.stringify({
-    api_key: apiKey,
-    query,
-    search_depth: 'basic',
-    max_results: 3,
-    include_raw_content: false,
-  });
+  const body  = JSON.stringify({ api_key: apiKey, query, search_depth: 'basic', max_results: 3 });
 
   return new Promise((resolve, reject) => {
     const req = https.request({
       hostname: 'api.tavily.com',
       path: '/search',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-    }, (res) => {
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, res => {
       let data = '';
-      res.on('data', chunk => data += chunk);
+      res.on('data', c => data += c);
       res.on('end', () => {
         try { resolve({ _source: 'tavily', ...JSON.parse(data) }); }
         catch (e) { reject(e); }
@@ -316,71 +332,34 @@ async function tavilySearch(query, apiKey) {
   });
 }
 
-// ── Extrator unificado (Serper + Tavily) ─────────────────────────────────────
+// ── Extrator unificado ──────────────────────────────────────────────────────
 
-/**
- * Extrai frases relacionais de qualquer resposta de API de busca.
- * Serper tem estrutura diferente de Tavily — normaliza aqui.
- */
 function extractSentences(response) {
   const raw = [];
 
   if (response._source === 'serper') {
-    // Serper: organic results + answerBox + knowledgeGraph
-    const organics = response.organic || [];
-    for (const r of organics) {
+    (response.organic || []).forEach(r => {
       if (r.snippet) raw.push(r.snippet);
-      if (r.sitelinks) {
-        r.sitelinks.forEach(sl => sl.snippet && raw.push(sl.snippet));
-      }
-    }
-
-    // Knowledge Graph — ouro puro para extração semântica
-    if (response.knowledgeGraph) {
-      const kg = response.knowledgeGraph;
-      if (kg.description) raw.push(kg.description);
-      if (kg.attributes) {
-        Object.entries(kg.attributes).forEach(([key, val]) => {
-          if (typeof val === 'string' && val.length < 120) {
-            // Usar "é" só quando o key não é já um verbo
-            const verb = /^(é|são|faz|usa|tem|possui|pertence)/.test(key) ? '' : ' é';
-            raw.push(`${kg.title || ''} ${key}${verb} ${val}`);
-          }
-        });
-      }
-    }
-
-    // Answer box
-    if (response.answerBox?.answer) raw.push(response.answerBox.answer);
+    });
+    if (response.knowledgeGraph?.description) raw.push(response.knowledgeGraph.description);
+    if (response.answerBox?.answer)  raw.push(response.answerBox.answer);
     if (response.answerBox?.snippet) raw.push(response.answerBox.snippet);
-
   } else {
-    // Tavily
-    const results = response.results || [];
-    for (const r of results) {
-      raw.push(r.content || r.snippet || '');
-    }
+    (response.results || []).forEach(r => raw.push(r.content || r.snippet || ''));
   }
 
-  // Fragmentar em frases e filtrar predicativas
   const sentences = [];
   for (const block of raw) {
     if (!block) continue;
-    const parts = block
-      .replace(/([.!?])\s+/g, '$1\n')
-      .split('\n')
-      .map(s => s.trim())
-      .filter(s => {
-        if (s.length < 15 || s.length > 200) return false;
-        return /\bé\b|\bsão\b|\bsignifica\b|\brefere-se\b|\bpermite\b|\bpossui\b|\bfaz\b|\busa\b/.test(s);
-      });
-    sentences.push(...parts);
+    block.replace(/([.!?])\s+/g, '$1\n').split('\n').map(s => s.trim()).filter(s => {
+      if (s.length < 15 || s.length > 200) return false;
+      return /\bé\b|\bsão\b|\bsignifica\b|\brefere-se\b|\bpermite\b|\bpossui\b|\bfaz\b|\busa\b/.test(s);
+    }).forEach(s => sentences.push(s));
   }
 
   return sentences;
 }
 
-// Utilitário local (não exportado)
 function shuffleInPlace(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -392,21 +371,12 @@ function shuffleInPlace(arr) {
 // FONTE 4 — Self-play
 // ---------------------------------------------------------------------------
 
-/**
- * O modelo gera respostas para prompts do grafo,
- * avalia a coerência, treina nos melhores outputs.
- *
- * Critérios de qualidade:
- *   - comprimento mínimo (não vazio)
- *   - sem repetição excessiva de tokens
- *   - tokens presentes no vocabulário confirmado
- */
 async function selfPlayPairs(model, db, vocab, rounds = 10) {
   if (!model.ready) return [];
 
-  // Buscar prompts candidatos do grafo
-  const snap = await db.collection('nexus_nodes')
-    .where('confirmed', '==', true)
+  // CORRIGIDO: nexus_graph + confidence === 'confirmed'
+  const snap = await db.collection('nexus_graph')
+    .where('confidence', '==', 'confirmed')
     .limit(30)
     .get();
 
@@ -416,62 +386,41 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
   snap.forEach(doc => nodes.push(doc.data()));
 
   const allPairs = [];
-  let goodGenerations = 0;
+  let good = 0;
 
   for (let i = 0; i < Math.min(rounds, nodes.length); i++) {
-    const node = nodes[Math.floor(Math.random() * nodes.length)];
-    const prompt = node.label || node.id.replace(/_/g, ' ');
+    const node   = nodes[Math.floor(Math.random() * nodes.length)];
+    const prompt = node.label || (node.id || '').replace(/_/g, ' ');
 
     try {
       const generated = model.generate(prompt, 20, 0.7);
-
       if (!generated) continue;
 
       const quality = scoreGeneration(generated, vocab);
-
       if (quality >= 0.5) {
-        // Boa geração: treinar nela
-        const fullSeq = `${prompt} ${generated}`;
-        const ids = vocab.tokenize(fullSeq);
+        const ids = vocab.tokenize(`${prompt} ${generated}`);
         if (ids.length >= 3) {
           allPairs.push(...makeTrainingPairs(ids));
-          goodGenerations++;
+          good++;
         }
       }
-    } catch (err) {
-      // Continua para o próximo
-    }
+    } catch (e) { /* continua */ }
   }
 
-  if (goodGenerations > 0) {
-    console.log(`[DATASET] Self-play: ${goodGenerations}/${rounds} gerações aprovadas`);
-  }
-
+  if (good > 0) console.log(`[DATASET] Self-play: ${good}/${rounds} gerações aprovadas`);
   return allPairs;
 }
 
-/**
- * Pontua qualidade de uma geração.
- * Retorna 0.0–1.0. Threshold para uso: >= 0.5
- */
 function scoreGeneration(text, vocab) {
   if (!text || text.length < 5) return 0;
-
-  const tokens = tokenizeText(text);
+  const tokens  = tokenizeText(text);
   if (tokens.length < 2) return 0;
-
-  // Penalizar repetição de tokens
-  const unique = new Set(tokens);
-  const diversityScore = unique.size / tokens.length;
-
-  // Percentual de tokens conhecidos no vocabulário
+  const unique  = new Set(tokens);
+  const divScore  = unique.size / tokens.length;
   const knownCount = tokens.filter(t => vocab.token2id[t] !== undefined).length;
   const knownScore = knownCount / tokens.length;
-
-  // Comprimento ideal: 5–30 tokens
-  const lenScore = tokens.length >= 5 && tokens.length <= 30 ? 1.0 : 0.5;
-
-  return (diversityScore * 0.4 + knownScore * 0.4 + lenScore * 0.2);
+  const lenScore   = tokens.length >= 5 && tokens.length <= 30 ? 1.0 : 0.5;
+  return divScore * 0.4 + knownScore * 0.4 + lenScore * 0.2;
 }
 
 // ---------------------------------------------------------------------------
