@@ -15,6 +15,13 @@
  *   - Integrado em fetchWebPatterns() e selfPlayPairs()
  *   - Evita duplicação, limita 20 nós/ciclo
  *   - Nós gerados com confidence: 'generated'
+ *
+ * CORREÇÕES v4:
+ *   - isNaN(w) → !/^\d+$/.test(w) (filtro correto de números)
+ *   - STOP_WORDS expandida com palavras problemáticas
+ *   - Filtro de qualidade para pares do web crawl
+ *   - Fallback com queries fixas quando grafo sem candidatos
+ *   - selfPlayPairs com fallback para nós 'generated'
  */
 
 const { tokenizeText, makeTrainingPairs } = require('./_akie_vocab');
@@ -44,6 +51,20 @@ const EXPANSION_CONFIG = {
     'ele', 'ela', 'eles', 'elas', 'este', 'esta', 'esse', 'essa',
     'isso', 'isto', 'aquilo', 'meu', 'minha', 'seu', 'sua',
     'nosso', 'nossa', 'qual', 'quais', 'quem', 'cujo', 'cuja',
+    // ── Palavras problemáticas detectadas em produção ──
+    'unk', 'pode', 'faz', 'vai', 'tem', 'pra', 'pro',
+    'tudo', 'nada', 'algo', 'cada', 'todo', 'toda',
+    'outro', 'outra', 'outros', 'outras',
+    'vez', 'vezes', 'parte',
+    'forma', 'maneira', 'modo', 'jeito',
+    'exemplo', 'caso', 'questão',
+    'aqui', 'ali', 'lá', 'cá',
+    'hoje', 'amanhã', 'ontem', 'agora',
+    'dia', 'noite', 'tarde', 'manhã',
+    'coisa', 'coisas', 'gente',
+    'tipo', 'tipos', 'tal', 'tais',
+    'assunto', 'tema', 'texto', 'frase',
+    'dado', 'dados', 'informação', 'informações',
   ]),
 };
 
@@ -113,7 +134,6 @@ function episodesToPairs(episodes, vocab) {
 
 // ---------------------------------------------------------------------------
 // FONTE 2 — Grafo semântico NEXUS → frases de treino
-// CORRIGIDO: usa nexus_graph + confidence === 'confirmed'
 // ---------------------------------------------------------------------------
 
 /**
@@ -234,7 +254,7 @@ function graphSentencesToPairs(sentences, vocab) {
 }
 
 // ---------------------------------------------------------------------------
-// NOVO — EXPANSÃO AUTOMÁTICA DO GRAFO
+// EXPANSÃO AUTOMÁTICA DO GRAFO
 // ---------------------------------------------------------------------------
 
 /**
@@ -262,7 +282,7 @@ async function extractAndExpandGraph(db, sentences, source = 'unknown') {
       .filter(w =>
         w.length >= EXPANSION_CONFIG.MIN_WORD_LENGTH &&
         !EXPANSION_CONFIG.STOP_WORDS.has(w) &&
-        isNaN(w) // ignora números puros
+        !/^\d+$/.test(w) // ignora números puros
       );
 
     // Contar frequência
@@ -323,7 +343,10 @@ async function extractAndExpandGraph(db, sentences, source = 'unknown') {
     // Criar relações com co-ocorrências mais frequentes
     const relations = [];
     const cooccurArray = Array.from(data.cooccurrences)
-      .filter(co => co.length >= EXPANSION_CONFIG.MIN_WORD_LENGTH)
+      .filter(co =>
+        co.length >= EXPANSION_CONFIG.MIN_WORD_LENGTH &&
+        !EXPANSION_CONFIG.STOP_WORDS.has(co) // também filtra stop words nas relações
+      )
       .slice(0, 5);
 
     for (const coWord of cooccurArray) {
@@ -401,8 +424,6 @@ function episodesToSentences(episodes) {
 
 // ---------------------------------------------------------------------------
 // FONTE 3 — Web crawl
-// CORRIGIDO: usa nexus_graph, filtra por nós com usage_count baixo
-// NOVO: expande o grafo automaticamente após coletar frases
 // ---------------------------------------------------------------------------
 
 async function fetchWebPatterns(db, vocab, maxQueries = 3) {
@@ -415,7 +436,6 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
   }
 
   // Nós com menor uso (precisam de mais conhecimento)
-  // CORRIGIDO: nexus_graph, sem filtro por campo 'weight' (não existe no schema)
   const snap = await db.collection('nexus_graph')
     .where('confidence', 'in', ['provisional', 'stale'])
     .limit(15)
@@ -424,13 +444,17 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
   let queries = [];
 
   if (snap.empty) {
-    // Fallback: pegar qualquer nó para expandir vocabulário
-    const allSnap = await db.collection('nexus_graph').limit(10).get();
-    if (allSnap.empty) return [];
-    allSnap.forEach(doc => {
-      const d = doc.data();
-      if (d.id) queries.push(d.id.replace(/_/g, ' '));
-    });
+    // Fallback: queries fixas de conhecimento geral
+    const fallbackQueries = [
+      'inteligência artificial aprendizado',
+      'linguagem natural processamento',
+      'como funciona rede neural',
+      'significado de conhecimento',
+      'tecnologia e inovação',
+    ];
+    shuffleInPlace(fallbackQueries);
+    queries = fallbackQueries.slice(0, maxQueries);
+    console.log('[DATASET] Web: usando queries fixas (grafo sem candidatos)');
   } else {
     snap.forEach(doc => {
       const d = doc.data();
@@ -443,7 +467,7 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
 
   // Executar buscas e coletar frases
   const allPairs = [];
-  const allSentences = []; // NOVO: coletar frases para expansão do grafo
+  const allSentences = [];
 
   for (const query of queries) {
     const searchPromises = [];
@@ -477,7 +501,7 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
     console.log(`[DATASET] Web (${src}): "${query}" → ${relevant.length} frases`);
   }
 
-  // ── NOVO: Expandir grafo com frases coletadas da web ──────────────────
+  // ── Expandir grafo com frases coletadas da web ──────────────────
   if (allSentences.length > 0) {
     try {
       const inserted = await extractAndExpandGraph(db, allSentences, 'web');
@@ -487,7 +511,18 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
     }
   }
 
-  return allPairs;
+  // ── FILTRO DE QUALIDADE ──────────────────────────────────────────
+  const vocabSize = vocab.size;
+  const filteredPairs = allPairs.filter(pair => {
+    const knownTokens = pair.filter(id => id < vocabSize);
+    return knownTokens.length === 2; // ambos os tokens precisam ser conhecidos
+  });
+
+  if (filteredPairs.length < allPairs.length) {
+    console.log(`[DATASET] Web: ${allPairs.length - filteredPairs.length} pares descartados (qualidade)`);
+  }
+
+  return filteredPairs;
 }
 
 // ── Serper API ──────────────────────────────────────────────────────────────
@@ -583,25 +618,36 @@ function shuffleInPlace(arr) {
 
 // ---------------------------------------------------------------------------
 // FONTE 4 — Self-play
-// NOVO: expande o grafo automaticamente com textos gerados
 // ---------------------------------------------------------------------------
 
 async function selfPlayPairs(model, db, vocab, rounds = 10) {
   if (!model.ready) return [];
 
-  // CORRIGIDO: nexus_graph + confidence === 'confirmed'
-  const snap = await db.collection('nexus_graph')
+  // Primeira tentativa: nós confirmados
+  let snap = await db.collection('nexus_graph')
     .where('confidence', '==', 'confirmed')
     .limit(30)
     .get();
 
-  if (snap.empty) return [];
+  // Fallback: incluir nós gerados também
+  if (snap.empty) {
+    console.log('[DATASET] Self-play: sem nós confirmed, usando generated...');
+    snap = await db.collection('nexus_graph')
+      .where('confidence', 'in', ['confirmed', 'generated'])
+      .limit(30)
+      .get();
+  }
+
+  if (snap.empty) {
+    console.log('[DATASET] Self-play: nenhum nó disponível no grafo');
+    return [];
+  }
 
   const nodes = [];
   snap.forEach(doc => nodes.push(doc.data()));
 
   const allPairs = [];
-  const allGeneratedTexts = []; // NOVO: coletar textos gerados para expansão
+  const allGeneratedTexts = [];
   let good = 0;
 
   for (let i = 0; i < Math.min(rounds, nodes.length); i++) {
@@ -627,7 +673,7 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
 
   if (good > 0) console.log(`[DATASET] Self-play: ${good}/${rounds} gerações aprovadas`);
 
-  // ── NOVO: Expandir grafo com textos gerados pelo self-play ────────────
+  // ── Expandir grafo com textos gerados pelo self-play ────────────
   if (allGeneratedTexts.length > 0) {
     try {
       const inserted = await extractAndExpandGraph(db, allGeneratedTexts, 'selfplay');
@@ -667,7 +713,7 @@ module.exports = {
   extractSentences,
   serperSearch,
   tavilySearch,
-  // NOVOS exports
+  // Expansão do grafo
   extractAndExpandGraph,
   episodesToSentences,
   sanitizeNodeId,
