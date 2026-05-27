@@ -1344,10 +1344,40 @@ async function runBootstrap(db, vocab) {
   console.log(`[BOOTSTRAP] vocabulário inicial: ${after} tokens (era ${before})`);
 
   // ── Marcar sentinela ──────────────────────────────────────────────────
-  await _markBootstrapComplete(db, insertedEpisodes, insertedNodes, after);
+await _markBootstrapComplete(db, insertedEpisodes, insertedNodes, after);
 
-  return true;
+// 🔥 NOVO: treino direto no modelo
+if (global.akieModel) {
+  console.log('[BOOTSTRAP] Iniciando treino direto no modelo...');
+
+  const pairs = [];
+
+  for (const ep of BOOTSTRAP_EPISODES) {
+    const inputIds  = global.akieModel.vocab.tokenize(ep.input);
+    const outputIds = global.akieModel.vocab.tokenize(ep.output);
+
+    for (let i = 1; i < outputIds.length; i++) {
+      const x = [
+        ...inputIds,
+        ...outputIds.slice(0, i)
+      ].slice(-global.akieModel.hparams.maxSeqLen);
+
+      const y = outputIds[i];
+
+      pairs.push({ x, y });
+    }
+  }
+
+  console.log(`[BOOTSTRAP] ${pairs.length} pares gerados para treino`);
+
+  await global.akieModel.trainBatch(pairs, 5);
+
+  console.log('[BOOTSTRAP] Treino inicial concluído');
+} else {
+  console.log('[BOOTSTRAP] Modelo não disponível para treino inicial');
 }
+
+return true;
 
 async function _markBootstrapComplete(db, episodes, nodes, vocabSize) {
   await db.collection('akie_worker_status').doc('bootstrap').set({
