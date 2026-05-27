@@ -234,11 +234,17 @@ async function init() {
 
   // Bootstrap — garante que o sistema nunca inicie com grafo vazio
   // Idempotente: só roda uma vez na vida do Firestore
-  const bootstrapped = await runBootstrap(state.db, state.vocab);
-  if (bootstrapped) {
-    // Salvar vocab expandido pelo bootstrap antes de construir o modelo
-    await saveVocab(state.vocab);
-  }
+ const bootstrapped = await runBootstrap(state.db, state.vocab);
+
+if (bootstrapped) {
+  await saveVocab(state.vocab);
+
+  console.log('[INIT] Recriando modelo após bootstrap...');
+
+  state.model = new AKIEModel(state.vocab);
+  state.model.build();
+  await state.model.save(CONFIG.modelDir);
+}
 
   console.log(`[INIT] Vocabulário: ${state.vocab.size} tokens`);
 
@@ -254,23 +260,7 @@ async function init() {
     state.model.build();
     await state.model.save(CONFIG.modelDir);
   } else {
-    // Modelo carregado — vocab pode ter menos tokens que o embedding salvo
-    // (ex: Volume do Railway montou tarde, vocab veio do fallback de 4 tokens)
-    const embVocabSize = state.model.embeddingVocabSize;
-    if (state.vocab.size < embVocabSize) {
-      console.log(`[INIT] Vocab (${state.vocab.size}) desalinhado com embedding (${embVocabSize}). Recuperando do Firestore...`);
-      try {
-        const doc = await state.db.collection('akie_worker_status').doc('vocabulary').get();
-        if (doc.exists) {
-          state.vocab = Vocabulary.fromJSON(doc.data());
-          state.model.vocab = state.vocab;
-          console.log(`[INIT] Vocab recuperado: ${state.vocab.size} tokens`);
-        }
-      } catch (e) {
-        console.warn('[INIT] Falha ao recuperar vocab do Firestore:', e.message);
-      }
-    }
-    // Verificar alinhamento após eventual recuperação
+    // Modelo carregado — verificar se vocab cresceu desde o último save
     await maybeRebuildForVocabGrowth();
   }
 
@@ -340,8 +330,7 @@ async function scheduler() {
     }
 
   } catch (err) {
-    console.error(`${tag} ERRO: ${err.message}`);
-    console.error(`${tag} STACK: ${err.stack}`);
+    console.error(`${tag} ERRO:`, err.message);
   }
 }
 
@@ -359,11 +348,9 @@ async function runMode(mode, ctx = {}) {
 
   switch (mode) {
     case MODE.INTERACTIVE: {
-      // Expandir vocab ANTES de gerar pares — garante que tokenize()
-      // usa o mesmo vocab que o modelo vai ter no momento do treino
-      await maybeExpandVocab(episodes);
       pairs = episodesToPairs(episodes, state.vocab);
       desc  = `${episodes.length} episódios → ${pairs.length} pares`;
+      await maybeExpandVocab(episodes);
       break;
     }
     case MODE.CONSOLIDATION: {
@@ -378,7 +365,7 @@ async function runMode(mode, ctx = {}) {
     }
     case MODE.EXPANSION: {
       const vocabBefore = state.vocab.size;
-      pairs = await fetchWebPatterns(state.db, state.vocab, 3);
+     pairs = await fetchWebPatterns(state.db, state.vocab, 1);
       desc  = `web crawl → ${pairs.length} pares`;
       // Sempre verificar crescimento de vocab, mesmo sem pairs
       // O fetchWebPatterns adiciona tokens ao vocab independentemente de gerar pares
@@ -463,19 +450,15 @@ async function loadOrCreateVocab() {
 }
 
 async function saveVocab(vocab) {
-  // Disco (Railway Volume)
   try {
     fs.mkdirSync(CONFIG.modelDir, { recursive: true });
     fs.writeFileSync(path.join(CONFIG.modelDir, 'akie_vocab.json'), JSON.stringify(vocab.toJSON(), null, 2));
   } catch (e) {
-    console.warn('[VOCAB] Falha ao salvar no disco:', e.message);
-  }
-  // Firestore — sempre, não apenas como fallback
-  // Garante recuperação mesmo quando o Volume não monta no boot
-  try {
-    await state.db.collection('akie_worker_status').doc('vocabulary').set(vocab.toJSON());
-  } catch (e) {
-    console.error('[VOCAB] Falha ao salvar no Firestore:', e.message);
+    try {
+      await state.db.collection('akie_worker_status').doc('vocabulary').set(vocab.toJSON());
+    } catch (e2) {
+      console.error('[VOCAB] Falha ao salvar:', e2.message);
+    }
   }
 }
 
