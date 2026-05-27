@@ -128,7 +128,9 @@ class AKIEModel {
       [pairs.length, this.hparams.maxSeqLen],
       'int32'
     );
-    const ys = tf.tensor1d(pairs.map(p => p.y), 'int32');
+    // float32 obrigatório — sparseCategoricalCrossentropy chama floor() internamente
+    // nos labels e tfjs-node não aceita int32 nessa operação
+    const ys = tf.tensor1d(pairs.map(p => p.y), 'float32');
 
     let lastLoss = null;
     let lastAcc = null;
