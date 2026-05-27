@@ -9,9 +9,43 @@
  *   - Campo weight → usar confidence + relations[].weight
  *   - fetchGraphSentences usa nexus_graph corretamente
  *   - fetchWebPatterns usa nexus_graph com filtro por score baixo
+ *
+ * NOVO v3 — EXPANSÃO AUTOMÁTICA DO GRAFO:
+ *   - extractAndExpandGraph(): extrai palavras-chave de frases e cria nós
+ *   - Integrado em fetchWebPatterns() e selfPlayPairs()
+ *   - Evita duplicação, limita 20 nós/ciclo
+ *   - Nós gerados com confidence: 'generated'
  */
 
 const { tokenizeText, makeTrainingPairs } = require('./_akie_vocab');
+
+// ---------------------------------------------------------------------------
+// CONFIGURAÇÕES DE EXPANSÃO DO GRAFO
+// ---------------------------------------------------------------------------
+
+const EXPANSION_CONFIG = {
+  MAX_NEW_NODES_PER_CYCLE: 20,       // máximo de nós novos por ciclo
+  MIN_WORD_LENGTH: 3,                // tamanho mínimo da palavra para virar nó
+  COOCCURRENCE_WINDOW: 5,            // janela para detectar co-ocorrência
+  STOP_WORDS: new Set([              // palavras ignoradas na extração
+    'o', 'a', 'os', 'as', 'um', 'uma', 'uns', 'umas',
+    'de', 'do', 'da', 'dos', 'das', 'em', 'no', 'na', 'nos', 'nas',
+    'por', 'pelo', 'pela', 'pelos', 'pelas', 'para', 'com', 'sem',
+    'sobre', 'sob', 'entre', 'até', 'desde', 'após', 'antes',
+    'e', 'ou', 'mas', 'porém', 'pois', 'porque', 'que', 'se',
+    'quando', 'onde', 'como', 'embora', 'ainda', 'já', 'também',
+    'não', 'sim', 'muito', 'pouco', 'mais', 'menos', 'bem', 'mal',
+    'sempre', 'nunca', 'então', 'assim', 'apenas', 'somente',
+    'ser', 'estar', 'ter', 'haver', 'fazer', 'ir', 'vir', 'dar',
+    'ver', 'saber', 'poder', 'querer', 'dever', 'precisar',
+    'falar', 'dizer', 'pedir', 'responder', 'perguntar',
+    'pensar', 'sentir', 'conhecer', 'entender', 'aprender',
+    'é', 'são', 'foi', 'foram', 'era', 'eram', 'está', 'estão',
+    'ele', 'ela', 'eles', 'elas', 'este', 'esta', 'esse', 'essa',
+    'isso', 'isto', 'aquilo', 'meu', 'minha', 'seu', 'sua',
+    'nosso', 'nossa', 'qual', 'quais', 'quem', 'cujo', 'cuja',
+  ]),
+};
 
 // ---------------------------------------------------------------------------
 // FONTE 1 — Episódios reais de interação
@@ -200,8 +234,175 @@ function graphSentencesToPairs(sentences, vocab) {
 }
 
 // ---------------------------------------------------------------------------
+// NOVO — EXPANSÃO AUTOMÁTICA DO GRAFO
+// ---------------------------------------------------------------------------
+
+/**
+ * Extrai palavras-chave de um conjunto de frases e expande o nexus_graph.
+ *
+ * @param {FirebaseFirestore.Firestore} db
+ * @param {string[]} sentences - Frases coletadas (web, self-play, etc.)
+ * @param {string} source - Origem: 'web', 'selfplay', 'episodes'
+ * @returns {number} Quantidade de nós inseridos
+ */
+async function extractAndExpandGraph(db, sentences, source = 'unknown') {
+  if (!sentences || sentences.length === 0) return 0;
+
+  // ── 1. Extrair palavras-chave de todas as frases ──────────────────────
+  const keywordMap = new Map(); // palavra → { count, cooccurrences: Set }
+
+  for (const sentence of sentences) {
+    if (!sentence) continue;
+
+    // Tokenizar e limpar
+    const words = sentence
+      .toLowerCase()
+      .replace(/[^a-záàâãéèêíìîóòôõúùûç0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w =>
+        w.length >= EXPANSION_CONFIG.MIN_WORD_LENGTH &&
+        !EXPANSION_CONFIG.STOP_WORDS.has(w) &&
+        isNaN(w) // ignora números puros
+      );
+
+    // Contar frequência
+    for (const word of words) {
+      if (!keywordMap.has(word)) {
+        keywordMap.set(word, { count: 0, cooccurrences: new Set() });
+      }
+      keywordMap.get(word).count++;
+    }
+
+    // Detectar co-ocorrências (janela deslizante)
+    for (let i = 0; i < words.length; i++) {
+      const windowEnd = Math.min(i + EXPANSION_CONFIG.COOCCURRENCE_WINDOW, words.length);
+      for (let j = i + 1; j < windowEnd; j++) {
+        if (words[i] !== words[j]) {
+          keywordMap.get(words[i])?.cooccurrences.add(words[j]);
+          keywordMap.get(words[j])?.cooccurrences.add(words[i]);
+        }
+      }
+    }
+  }
+
+  // ── 2. Filtrar palavras mais relevantes (mínimo 2 ocorrências) ───────
+  const candidates = Array.from(keywordMap.entries())
+    .filter(([, data]) => data.count >= 2)
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, EXPANSION_CONFIG.MAX_NEW_NODES_PER_CYCLE * 2); // margem extra
+
+  if (candidates.length === 0) {
+    console.log(`[EXPANSION] Nenhuma palavra-chave relevante extraída de ${source}`);
+    return 0;
+  }
+
+  // ── 3. Verificar quais já existem no grafo ───────────────────────────
+  const candidateIds = candidates.map(([word]) => sanitizeNodeId(word));
+  const existingIds  = new Set();
+
+  // Busca em batches (Firestore permite até 30 IDs no 'in')
+  for (let i = 0; i < candidateIds.length; i += 30) {
+    const chunk = candidateIds.slice(i, i + 30);
+    const snap  = await db.collection('nexus_graph')
+      .where('__name__', 'in', chunk)
+      .get();
+    snap.forEach(doc => existingIds.add(doc.id));
+  }
+
+  // ── 4. Criar novos nós ───────────────────────────────────────────────
+  const newNodes = [];
+  const addedIds = new Set();
+
+  for (const [word, data] of candidates) {
+    const nodeId = sanitizeNodeId(word);
+
+    // Pular se já existe ou já foi adicionado neste ciclo
+    if (existingIds.has(nodeId) || addedIds.has(nodeId)) continue;
+    if (newNodes.length >= EXPANSION_CONFIG.MAX_NEW_NODES_PER_CYCLE) break;
+
+    // Criar relações com co-ocorrências mais frequentes
+    const relations = [];
+    const cooccurArray = Array.from(data.cooccurrences)
+      .filter(co => co.length >= EXPANSION_CONFIG.MIN_WORD_LENGTH)
+      .slice(0, 5);
+
+    for (const coWord of cooccurArray) {
+      relations.push({
+        target: sanitizeNodeId(coWord),
+        type: 'related_to',
+        weight: 0.3, // peso inicial baixo para relações geradas
+      });
+    }
+
+    // Criar nó
+    const node = {
+      id: nodeId,
+      label: word,
+      contexts: [`${source}_generated`],
+      verbs: [],
+      relations: relations,
+      confidence: 'generated',
+      created_at: new Date().toISOString(),
+      usage_count: 0,
+      source: source,
+      occurrence_count: data.count,
+    };
+
+    newNodes.push(node);
+    addedIds.add(nodeId);
+  }
+
+  // ── 5. Salvar no Firestore em batch ──────────────────────────────────
+  if (newNodes.length > 0) {
+    const BATCH_SIZE = 400;
+    for (let i = 0; i < newNodes.length; i += BATCH_SIZE) {
+      const batch = db.batch();
+      const chunk = newNodes.slice(i, i + BATCH_SIZE);
+      for (const node of chunk) {
+        const ref = db.collection('nexus_graph').doc(node.id);
+        batch.set(ref, node);
+      }
+      await batch.commit();
+    }
+    console.log(`[EXPANSION] ${newNodes.length} novos nós inseridos no nexus_graph (source: ${source})`);
+    console.log(`[EXPANSION] Palavras: ${newNodes.map(n => n.label).join(', ')}`);
+  } else {
+    console.log(`[EXPANSION] Nenhum nó novo para adicionar (source: ${source})`);
+  }
+
+  return newNodes.length;
+}
+
+/**
+ * Sanitiza uma palavra para uso como ID de nó no Firestore.
+ */
+function sanitizeNodeId(word) {
+  return word
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // remove acentos
+    .replace(/[^a-z0-9]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .substring(0, 80); // limite de tamanho
+}
+
+/**
+ * Extrai frases de um array de objetos {input, output} para expandir o grafo.
+ */
+function episodesToSentences(episodes) {
+  const sentences = [];
+  for (const ep of episodes) {
+    if (ep.input) sentences.push(ep.input);
+    if (ep.output) sentences.push(ep.output);
+  }
+  return sentences;
+}
+
+// ---------------------------------------------------------------------------
 // FONTE 3 — Web crawl
 // CORRIGIDO: usa nexus_graph, filtra por nós com usage_count baixo
+// NOVO: expande o grafo automaticamente após coletar frases
 // ---------------------------------------------------------------------------
 
 async function fetchWebPatterns(db, vocab, maxQueries = 3) {
@@ -220,30 +421,29 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
     .limit(15)
     .get();
 
+  let queries = [];
+
   if (snap.empty) {
     // Fallback: pegar qualquer nó para expandir vocabulário
     const allSnap = await db.collection('nexus_graph').limit(10).get();
     if (allSnap.empty) return [];
-    const candidates = [];
     allSnap.forEach(doc => {
       const d = doc.data();
-      if (d.id) candidates.push(d.id.replace(/_/g, ' '));
+      if (d.id) queries.push(d.id.replace(/_/g, ' '));
     });
-    return runWebQueries(candidates.slice(0, maxQueries), vocab, serperKey, tavilyKey);
+  } else {
+    snap.forEach(doc => {
+      const d = doc.data();
+      if (d.id) queries.push(d.id.replace(/_/g, ' '));
+    });
+    shuffleInPlace(queries);
   }
 
-  const candidates = [];
-  snap.forEach(doc => {
-    const d = doc.data();
-    if (d.id) candidates.push(d.id.replace(/_/g, ' '));
-  });
+  queries = queries.slice(0, maxQueries);
 
-  shuffleInPlace(candidates);
-  return runWebQueries(candidates.slice(0, maxQueries), vocab, serperKey, tavilyKey);
-}
-
-async function runWebQueries(queries, vocab, serperKey, tavilyKey) {
+  // Executar buscas e coletar frases
   const allPairs = [];
+  const allSentences = []; // NOVO: coletar frases para expansão do grafo
 
   for (const query of queries) {
     const searchPromises = [];
@@ -261,6 +461,10 @@ async function runWebQueries(queries, vocab, serperKey, tavilyKey) {
     const unique   = [...new Map(sentences.map(s => [s.toLowerCase(), s])).values()];
     const relevant = unique.filter(s => s.length > 15 && s.length < 200).slice(0, 30);
 
+    // Coletar frases para expansão
+    allSentences.push(...relevant);
+
+    // Gerar pares de treino
     for (const sentence of relevant) {
       const tokens = tokenizeText(sentence);
       vocab.addTokens(tokens);
@@ -271,6 +475,16 @@ async function runWebQueries(queries, vocab, serperKey, tavilyKey) {
     const src = [serperKey ? 'Serper' : null, tavilyKey ? 'Tavily' : null]
       .filter(Boolean).join('+');
     console.log(`[DATASET] Web (${src}): "${query}" → ${relevant.length} frases`);
+  }
+
+  // ── NOVO: Expandir grafo com frases coletadas da web ──────────────────
+  if (allSentences.length > 0) {
+    try {
+      const inserted = await extractAndExpandGraph(db, allSentences, 'web');
+      console.log(`[DATASET] Expansão do grafo via web: ${inserted} nós adicionados`);
+    } catch (err) {
+      console.error('[DATASET] Erro na expansão do grafo (web):', err.message);
+    }
   }
 
   return allPairs;
@@ -369,6 +583,7 @@ function shuffleInPlace(arr) {
 
 // ---------------------------------------------------------------------------
 // FONTE 4 — Self-play
+// NOVO: expande o grafo automaticamente com textos gerados
 // ---------------------------------------------------------------------------
 
 async function selfPlayPairs(model, db, vocab, rounds = 10) {
@@ -386,6 +601,7 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
   snap.forEach(doc => nodes.push(doc.data()));
 
   const allPairs = [];
+  const allGeneratedTexts = []; // NOVO: coletar textos gerados para expansão
   let good = 0;
 
   for (let i = 0; i < Math.min(rounds, nodes.length); i++) {
@@ -402,12 +618,25 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
         if (ids.length >= 3) {
           allPairs.push(...makeTrainingPairs(ids));
           good++;
+          // Coletar texto para expansão
+          allGeneratedTexts.push(`${prompt} ${generated}`);
         }
       }
     } catch (e) { /* continua */ }
   }
 
   if (good > 0) console.log(`[DATASET] Self-play: ${good}/${rounds} gerações aprovadas`);
+
+  // ── NOVO: Expandir grafo com textos gerados pelo self-play ────────────
+  if (allGeneratedTexts.length > 0) {
+    try {
+      const inserted = await extractAndExpandGraph(db, allGeneratedTexts, 'selfplay');
+      console.log(`[DATASET] Expansão do grafo via self-play: ${inserted} nós adicionados`);
+    } catch (err) {
+      console.error('[DATASET] Erro na expansão do grafo (self-play):', err.message);
+    }
+  }
+
   return allPairs;
 }
 
@@ -438,4 +667,9 @@ module.exports = {
   extractSentences,
   serperSearch,
   tavilySearch,
+  // NOVOS exports
+  extractAndExpandGraph,
+  episodesToSentences,
+  sanitizeNodeId,
+  EXPANSION_CONFIG,
 };
