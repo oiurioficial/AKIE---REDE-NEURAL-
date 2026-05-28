@@ -143,6 +143,25 @@ class ExtractLastToken extends tf.layers.Layer {
 tf.serialization.registerClass(ExtractLastToken);
 
 // ---------------------------------------------------------------------------
+// Helper: cópia recursiva de diretório (compatível com Node.js < 16.7)
+// fs.promises.cp só existe a partir do Node 16.7 — não depender dele.
+// ---------------------------------------------------------------------------
+
+async function _copyDir(src, dst) {
+  await fs.promises.mkdir(dst, { recursive: true });
+  const entries = await fs.promises.readdir(src, { withFileTypes: true });
+  for (const entry of entries) {
+    const srcPath = path.join(src, entry.name);
+    const dstPath = path.join(dst, entry.name);
+    if (entry.isDirectory()) {
+      await _copyDir(srcPath, dstPath);
+    } else {
+      await fs.promises.copyFile(srcPath, dstPath);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // AKIEModel
 // ---------------------------------------------------------------------------
 
@@ -314,30 +333,47 @@ class AKIEModel {
     const tmpDir = `${dir}_tmp`;
     const bakDir = `${dir}_bak`;
 
-    // 1. Escreve inteiramente no diretório temporário — nunca toca o dir principal
+    // ── Escreve inteiramente no temporário antes de tocar no dir principal ──
     await fs.promises.rm(tmpDir, { recursive: true, force: true });
     await fs.promises.mkdir(tmpDir, { recursive: true });
-    await this.model.save(`file://${tmpDir}`);
+
+    // ESTRATÉGIA: salvar pesos como buffer binário em vez de model.save().
+    // model.save() do TF.js gera model.json com shapes "[,]" em camadas
+    // customizadas — bug conhecido dessa versão do tfjs-node.
+    // Aqui salvamos: manifest de shapes (JSON leve) + pesos brutos (binário).
+    const weights   = this.model.getWeights();
+    const manifest  = weights.map(w => ({ name: w.name, shape: w.shape }));
+    const allData   = weights.map(w => w.dataSync()); // Float32Array por peso
+
+    // Calcular tamanho total e escrever buffer único
+    const totalFloats = allData.reduce((sum, arr) => sum + arr.length, 0);
+    const buffer      = Buffer.allocUnsafe(totalFloats * 4);
+    let offset        = 0;
+    for (const arr of allData) {
+      for (const v of arr) { buffer.writeFloatLE(v, offset); offset += 4; }
+    }
+
+    await fs.promises.writeFile(path.join(tmpDir, 'weight_manifest.json'), JSON.stringify(manifest));
+    await fs.promises.writeFile(path.join(tmpDir, 'weights.bin'), buffer);
 
     const meta = {
-      trainSteps:          this.trainSteps,
-      vocabSize:           this.vocab.size,
-      embeddingVocabSize:  this.embeddingVocabSize,
-      hparams:             this.hparams,
-      savedAt:             new Date().toISOString(),
+      trainSteps:         this.trainSteps,
+      vocabSize:          this.vocab.size,
+      embeddingVocabSize: this.embeddingVocabSize,
+      hparams:            this.hparams,
+      savedAt:            new Date().toISOString(),
+      format:             'weights_bin_v1',
     };
     await fs.promises.writeFile(path.join(tmpDir, 'akie_meta.json'), JSON.stringify(meta, null, 2));
     await fs.promises.writeFile(path.join(tmpDir, 'akie_vocab.json'), JSON.stringify(this.vocab.toJSON(), null, 2));
 
-    // 2. Promove save anterior para backup (preserva último estado íntegro)
-    if (fs.existsSync(path.join(dir, 'model.json'))) {
+    // ── Swap atômico: dir → bak, tmp → dir ──
+    if (fs.existsSync(path.join(dir, 'akie_meta.json'))) {
       await fs.promises.rm(bakDir, { recursive: true, force: true });
       await fs.promises.rename(dir, bakDir);
     } else {
       await fs.promises.rm(dir, { recursive: true, force: true });
     }
-
-    // 3. Rename atômico: tmp → dir (operação indivisível no mesmo filesystem)
     await fs.promises.rename(tmpDir, dir);
 
     console.log(`[AKIE] Transformer salvo em ${dir} (steps: ${this.trainSteps})`);
@@ -345,65 +381,65 @@ class AKIEModel {
 
   async load(dir) {
     const bakDir = `${dir}_bak`;
-    const candidates = [dir, bakDir];
 
-    for (const tryDir of candidates) {
-      const modelPath = path.join(tryDir, 'model.json');
+    for (const tryDir of [dir, bakDir]) {
+      const metaPath     = path.join(tryDir, 'akie_meta.json');
+      const manifestPath = path.join(tryDir, 'weight_manifest.json');
+      const weightsPath  = path.join(tryDir, 'weights.bin');
 
-      if (!fs.existsSync(modelPath)) {
+      if (!fs.existsSync(metaPath) || !fs.existsSync(manifestPath) || !fs.existsSync(weightsPath)) {
         const files = fs.existsSync(tryDir) ? fs.readdirSync(tryDir) : [];
-        console.log(`[AKIE] Procurando em: ${modelPath}`);
+        console.log(`[AKIE] Procurando em: ${path.join(tryDir, 'weights.bin')}`);
         console.log(`[AKIE] Arquivos: ${files.join(', ') || 'nenhum'}`);
         continue;
       }
 
-      // Validação rápida do model.json antes de passar para o TF
-      // Previne o erro "Tensor must have a shape comprised of positive integers but got shape [,]"
       try {
-        const raw = fs.readFileSync(modelPath, 'utf8');
-        if (/\[,/.test(raw) || raw.includes('"shape":[]')) {
-          console.warn(`[AKIE] ${tryDir}/model.json corrompido (shape inválido). ${tryDir === dir ? 'Tentando backup...' : 'Backup também corrompido.'}`);
-          if (tryDir === dir) {
-            await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+        const meta     = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+
+        this.trainSteps         = meta.trainSteps         || 0;
+        this.embeddingVocabSize = meta.embeddingVocabSize || meta.vocabSize || this.vocab.size;
+
+        // ── Reconstruir arquitetura do código (nunca falha) ──
+        const buildVocab = { ...this.vocab, size: this.embeddingVocabSize };
+        const shell = new AKIEModel(buildVocab, this.hparams);
+        shell.build();
+
+        // ── Restaurar pesos do buffer binário ──
+        const buffer = fs.readFileSync(weightsPath);
+        let offset   = 0;
+        const tensors = manifest.map(w => {
+          const numFloats = w.shape.reduce((a, b) => a * b, 1);
+          const arr = new Float32Array(numFloats);
+          for (let i = 0; i < numFloats; i++) {
+            arr[i] = buffer.readFloatLE(offset); offset += 4;
           }
-          continue;
-        }
-      } catch (readErr) {
-        console.warn(`[AKIE] Não foi possível ler ${modelPath}: ${readErr.message}`);
-        continue;
-      }
+          return tf.tensor(arr, w.shape, 'float32');
+        });
 
-      try {
-        const metaPath = path.join(tryDir, 'akie_meta.json');
-        let savedVocabSize = this.vocab.size;
-        if (fs.existsSync(metaPath)) {
-          const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
-          this.trainSteps = meta.trainSteps || 0;
-          savedVocabSize  = meta.vocabSize  || this.vocab.size;
-        }
+        shell.model.setWeights(tensors);
+        tensors.forEach(t => t.dispose());
 
-        this.model = await tf.loadLayersModel(`file://${tryDir}/model.json`);
+        this.model     = shell.model;
         this.optimizer = tf.train.adam(this.hparams.learningRate);
-        this.model.compile({ optimizer: this.optimizer, loss: 'sparseCategoricalCrossentropy', metrics: ['accuracy'] });
-
-        try {
-          this.embeddingVocabSize = this.model.getLayer('embedding').getWeights()[0].shape[0];
-        } catch {
-          this.embeddingVocabSize = savedVocabSize;
-        }
-
+        this.model.compile({
+          optimizer: this.optimizer,
+          loss:      'sparseCategoricalCrossentropy',
+          metrics:   ['accuracy'],
+        });
         this.ready = true;
 
         if (tryDir === bakDir) {
           console.warn(`[AKIE] Recuperado do backup. (steps: ${this.trainSteps})`);
-          // Promove backup para dir principal para o próximo save sobrescrever corretamente
+          // Promove bak → dir para o próximo save sobrescrever corretamente
           await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
-          await fs.promises.cp(bakDir, dir, { recursive: true });
+          await _copyDir(bakDir, dir);
         } else {
           console.log(`[AKIE] Transformer carregado. (steps: ${this.trainSteps}, embVocab: ${this.embeddingVocabSize})`);
         }
 
-        // Expande vocab se cresceu desde o último save
+        // Expande vocab se cresceu
         if (this.vocab.size > this.embeddingVocabSize) {
           console.log(`[AKIE] Vocab cresceu (${this.embeddingVocabSize} → ${this.vocab.size}). Expandindo...`);
           await this.expandVocabulary(this.vocab.size);
