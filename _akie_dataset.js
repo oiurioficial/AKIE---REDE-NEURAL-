@@ -308,12 +308,46 @@ function relationToSentence(source, relType, target) {
 
 function graphSentencesToPairs(sentences, vocab) {
   const allPairs = [];
-  for (const sentence of sentences) {
+  const MAX_SEQ  = 64;
+
+  // Prefixos variados para reduzir overfitting no stub de pergunta
+  const STUBS = [
+    'u: o que é',
+    'u: me fale sobre',
+    'u: como funciona',
+    'u: explica sobre',
+    'u: o que você sabe sobre',
+  ];
+
+  for (let i = 0; i < sentences.length; i++) {
+    const sentence = sentences[i];
     if (!sentence) continue;
-    const ids = vocab.tokenize(sentence);
-    if (ids.length < 3) continue;
-    allPairs.push(...makeTrainingPairs(ids));
+
+    // Primeiro termo da frase = tópico da pergunta
+    const words = sentence.split(/\s+/).filter(w => w.length > 2);
+    if (words.length < 2) continue;
+
+    const stub          = STUBS[i % STUBS.length];
+    const contextStr    = `${stub} ${words[0]}`;
+    const responseStr   = `a: ${sentence}`;
+
+    const contextTokens  = vocab.tokenize(contextStr);
+    const responseTokens = vocab.tokenize(responseStr);
+    if (!contextTokens.length || responseTokens.length < 2) continue;
+
+    // Teacher-forcing por posição — formato idêntico ao SYNTHETIC e INTERACTIVE
+    for (let pos = 1; pos < responseTokens.length; pos++) {
+      const prefix    = responseTokens.slice(0, pos);
+      const rawSeq    = [...contextTokens, ...prefix];
+      const truncated = rawSeq.slice(-(MAX_SEQ - 1));
+      const padded    = [
+        ...Array(Math.max(0, MAX_SEQ - truncated.length)).fill(0),
+        ...truncated,
+      ];
+      allPairs.push({ x: padded, y: responseTokens[pos] });
+    }
   }
+
   return allPairs;
 }
 
