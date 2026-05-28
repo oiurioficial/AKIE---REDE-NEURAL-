@@ -248,99 +248,109 @@ const LEXICAL_VARIATIONS = {
 };
 
 /**
- * Gera conversas sintéticas aplicando pequenas variações
+ * Gera um par de teacher forcing para uma posição específica da resposta.
+ *
+ * x = contextTokens + responseTokens[0..pos-1], padded à esquerda até maxSeqLen
+ * y = responseTokens[pos]
+ *
+ * @param {number[]} contextTokens
+ * @param {number[]} responseTokens
+ * @param {number} pos - índice do token a predizer (1-based dentro da resposta)
+ * @param {number} maxSeqLen
+ * @returns {{ x: number[], y: number } | null}
+ */
+function buildTeacherForcingPair(contextTokens, responseTokens, pos, maxSeqLen) {
+  if (pos < 1 || pos >= responseTokens.length) return null;
+
+  // Sequência de entrada: contexto + prefixo da resposta até pos-1 (exclusive)
+  const prefix = responseTokens.slice(0, pos);
+  const rawSeq  = [...contextTokens, ...prefix];
+
+  // Truncar pela esquerda para caber em maxSeqLen - 1 (reserva espaço para ao menos 1 token)
+  const truncated = rawSeq.slice(-(maxSeqLen - 1));
+
+  // Left-padding com PAD (token 0)
+  const padded = [
+    ...Array(Math.max(0, maxSeqLen - truncated.length)).fill(0),
+    ...truncated,
+  ];
+
+  return { x: padded, y: responseTokens[pos] };
+}
+
+/**
+ * Gera conversas sintéticas com teacher forcing posicional.
+ *
+ * Para cada par (contexto, resposta) de cada template, gera um par de treino
+ * por posição da resposta: predizer responseTokens[pos] dado contexto +
+ * responseTokens[0..pos-1]. Isso produz sinal real de LM ao invés de
+ * apenas memorizar o último token.
  *
  * @param {Vocabulary} vocab - Instância do vocabulário
- * @param {number} targetCount - Número de pares desejados
- * @returns {Promise<Array>} Array de pares {x: int[], y: int}
+ * @param {number} targetCount - Número máximo de pares desejados
+ * @param {number} maxSeqLen - Deve coincidir com HPARAMS.maxSeqLen (default 64)
+ * @returns {Promise<Array>} Array de pares { x: number[], y: number }
  */
-async function generateSyntheticConversations(vocab, targetCount = 200) {
+async function generateSyntheticConversations(vocab, targetCount = 200, maxSeqLen = 64) {
   const pairs = [];
 
-  // Primeiro: usar templates diretos
   for (const template of CONVERSATION_TEMPLATES) {
+    if (pairs.length >= targetCount) break;
+
+    const contextTokens = vocab.tokenize(template.context);
+    if (contextTokens.length === 0) continue;
+
     for (const response of template.responses) {
       if (pairs.length >= targetCount) break;
 
-      const contextTokens = vocab.tokenize(template.context);
       const responseTokens = vocab.tokenize(response);
+      // Resposta precisa de ao menos 2 tokens para gerar pelo menos 1 par posicional
+      if (responseTokens.length < 2) continue;
 
-      if (contextTokens.length > 0 && responseTokens.length > 0) {
-        // Pegar último token da resposta como label
-        const lastToken = responseTokens[responseTokens.length - 1];
+      // Teacher forcing: um par por posição (predizer token[1] até token[N-1])
+      for (let pos = 1; pos < responseTokens.length; pos++) {
+        if (pairs.length >= targetCount) break;
 
-        // Montar sequência: contexto preenchido até maxSeqLen - 1
-        const maxSeqLen = 64; // Deve coincidir com HPARAMS.maxSeqLen
-        const inputSeq = contextTokens.slice(-Math.max(0, maxSeqLen - 1));
-
-        // Padding
-        const padded = [
-          ...Array(Math.max(0, maxSeqLen - inputSeq.length)).fill(0), // PAD token
-          ...inputSeq,
-        ];
-
-        pairs.push({
-          x: padded,
-          y: lastToken,
-        });
+        const pair = buildTeacherForcingPair(contextTokens, responseTokens, pos, maxSeqLen);
+        if (pair) pairs.push(pair);
       }
     }
-
-    if (pairs.length >= targetCount) break;
   }
 
-  // Segundo: gerar variações dos templates (multiplicar dados)
+  // Se ainda faltam pares, reutilizar templates com shuffle de resposta para
+  // aumentar diversidade sem duplicar pares idênticos
   if (pairs.length < targetCount) {
-    const remainingNeeded = targetCount - pairs.length;
-    let added = 0;
+    const seen = new Set(pairs.map(p => `${p.x.join(',')}_${p.y}`));
 
+    outer:
     for (const template of CONVERSATION_TEMPLATES) {
-      if (added >= remainingNeeded) break;
+      const contextTokens = vocab.tokenize(template.context);
+      if (contextTokens.length === 0) continue;
 
-      for (let i = 0; i < Math.min(2, template.responses.length); i++) {
-        if (added >= remainingNeeded) break;
+      // Embaralhar respostas para variar a ordem
+      const shuffled = [...template.responses].sort(() => Math.random() - 0.5);
 
-        // Aplicar pequena variação no contexto (se houver)
-        let contextVar = template.context;
-        const words = contextVar.split(/\s+/);
-        if (words.length > 2 && Math.random() < 0.3) {
-          // Chance de fazer pequena mudança
-          const randIdx = Math.floor(Math.random() * (words.length - 1));
-          // Apenas exemplo simples: não fazemos variação elaborada aqui
-          // Em produção, poderia usar um dicionário de sinônimos
-        }
-
-        const responseIdx = i % template.responses.length;
-        const response = template.responses[responseIdx];
-
-        const contextTokens = vocab.tokenize(contextVar);
+      for (const response of shuffled) {
         const responseTokens = vocab.tokenize(response);
+        if (responseTokens.length < 2) continue;
 
-        if (contextTokens.length > 0 && responseTokens.length > 0) {
-          const lastToken = responseTokens[responseTokens.length - 1];
-          const maxSeqLen = 64;
-          const inputSeq = contextTokens.slice(-Math.max(0, maxSeqLen - 1));
+        for (let pos = 1; pos < responseTokens.length; pos++) {
+          if (pairs.length >= targetCount) break outer;
 
-          const padded = [
-            ...Array(Math.max(0, maxSeqLen - inputSeq.length)).fill(0),
-            ...inputSeq,
-          ];
+          const pair = buildTeacherForcingPair(contextTokens, responseTokens, pos, maxSeqLen);
+          if (!pair) continue;
 
-          // Verificar se este par é diferente dos já adicionados (evitar duplicação)
-          const isDuplicate = pairs.some(p =>
-            JSON.stringify(p.x) === JSON.stringify(padded) && p.y === lastToken
-          );
-
-          if (!isDuplicate) {
-            pairs.push({ x: padded, y: lastToken });
-            added++;
+          const key = `${pair.x.join(',')}_${pair.y}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            pairs.push(pair);
           }
         }
       }
     }
   }
 
-  console.log(`[SYNTHETIC] Geradas ${pairs.length} conversas sintéticas`);
+  console.log(`[SYNTHETIC] Geradas ${pairs.length} conversas sintéticas (teacher forcing posicional)`);
   return pairs;
 }
 
