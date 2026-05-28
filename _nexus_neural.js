@@ -298,38 +298,53 @@ class AKIEModel {
   async trainBatch(pairs, epochs = 3) {
     if (!this.ready || !pairs.length) return { loss: null, accuracy: null };
 
-    const xs = tf.data.generator(function* () {
-      for (const pair of pairs) {
-        yield [tf.tensor1d(pair.x, 'int32'), tf.tensor1d([pair.y], 'int32')];
-      }
-    })
-      .batch(this.hparams.batchSize)
-      .repeat(epochs);
+    const { batchSize } = this.hparams;
+    let totalLoss = 0;
+    let totalAcc  = 0;
+    let steps     = 0;
 
-    const history = await this.model.fitDataset(xs, {
-      epochs,
-      verbose: 0,
-    });
+    for (let ep = 0; ep < epochs; ep++) {
+      for (let i = 0; i < pairs.length; i += batchSize) {
+        const batch = pairs.slice(i, i + batchSize);
+        if (!batch.length) continue;
 
-    // fitDataset pode retornar Tensor em vez de scalar — extrair valor JS seguro
-    const _extractScalar = (v) => {
-      if (v == null) return null;
-      if (typeof v === 'number') return isFinite(v) && !isNaN(v) ? v : null;
-      if (typeof v.dataSync === 'function') {
-        try { const s = v.dataSync()[0]; return isFinite(s) && !isNaN(s) ? s : null; } catch { return null; }
-      }
-      if (typeof v.arraySync === 'function') {
-        try { const s = v.arraySync(); return isFinite(s) && !isNaN(s) ? s : null; } catch { return null; }
-      }
-      return null;
-    };
+        const seqLen = batch[0].x.length;
+        const xs = tf.tensor2d(batch.map(p => p.x), [batch.length, seqLen], 'int32');
+        const ys = tf.tensor1d(batch.map(p => p.y), 'int32');
 
-    const rawLoss = history.history.loss[history.history.loss.length - 1];
-    const rawAcc  = history.history.acc ? history.history.acc[history.history.acc.length - 1] : null;
-    const loss     = _extractScalar(rawLoss);
-    const accuracy = _extractScalar(rawAcc);
+        let result;
+        try {
+          result = this.model.trainOnBatch(xs, ys);
+          // trainOnBatch pode retornar Promise ou valor direto
+          if (result && typeof result.then === 'function') result = await result;
+        } finally {
+          xs.dispose();
+          ys.dispose();
+        }
+
+        // result pode ser: number, number[], Tensor, ou array de Tensors
+        const _toNum = (v) => {
+          if (v == null) return null;
+          if (typeof v === 'number') return isFinite(v) ? v : null;
+          if (Array.isArray(v)) return _toNum(v[0]);
+          if (typeof v.dataSync === 'function') {
+            try { const s = v.dataSync()[0]; v.dispose?.(); return isFinite(s) ? s : null; } catch { return null; }
+          }
+          return null;
+        };
+
+        const batchLoss = Array.isArray(result) ? _toNum(result[0]) : _toNum(result);
+        const batchAcc  = Array.isArray(result) && result.length > 1 ? _toNum(result[1]) : null;
+
+        if (batchLoss !== null) { totalLoss += batchLoss; steps++; }
+        if (batchAcc  !== null) totalAcc += batchAcc;
+      }
+    }
 
     this.trainSteps += pairs.length * epochs;
+
+    const loss     = steps > 0 ? totalLoss / steps : null;
+    const accuracy = steps > 0 && totalAcc > 0 ? totalAcc / steps : null;
     return { loss, accuracy };
   }
 
