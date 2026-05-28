@@ -5,10 +5,15 @@
  * Baseado na lógica de intenção do _aether.js (AETHER OS).
  * 
  * FLUXO:
- *   input → processBehavior(input, context?) → { mode, input, output?, context? }
+ *   input → processBehavior(input, context?) → { mode, input, output?, context?, confidence }
  *     ↓
- *   se output definido → resposta direta (refino) — NÃO chama modelo
- *   se output vazio    → enviar input enriquecido para model.generate()
+ *   se output definido E confidence > 0.85 → resposta direta — NÃO chama modelo
+ *   caso contrário                         → enviar input enriquecido para model.generate()
+ *
+ * CAMPO confidence (0.0 – 1.0):
+ *   > 0.85  — behavior tem resposta determinística confiável (clarificação, refino externo)
+ *   0.40–0.84 — behavior enriqueceu o input mas deixa inferência neural decidir
+ *   < 0.40  — neural obrigatório (saudação, código, análise complexa)
  * 
  * MODOS:
  *   SOCIAL  — conversa casual, saudação, pergunta simples
@@ -227,6 +232,8 @@ function handleRefineMode(input, options) {
       mode: 'refine',
       input: input,
       output: refinedPrompt,
+      // Refino externo tem alta confiança — resposta direta justificada
+      confidence: 0.92,
       context: null,
     };
   }
@@ -239,6 +246,8 @@ function handleRefineMode(input, options) {
     mode: 'refine',
     input: refinedInput,
     output: null, // sem output = vai para o modelo com input enriquecido
+    // Refino simples (fallback) — confiança moderada, inferência neural entra
+    confidence: 0.55,
     context: null,
   };
 }
@@ -251,6 +260,8 @@ function handleCodeMode(input, options) {
     mode: 'code',
     input: input,
     output: null,
+    // Código é sempre inferência neural — behavior não tem resposta direta
+    confidence: 0.0,
     context: CODE_EXTRA_CONTEXT,
   };
 }
@@ -268,6 +279,8 @@ function handleAnalyzeMode(input, options) {
       mode: 'analyze',
       input: input,
       output: clarification, // resposta direta — NÃO chama modelo
+      // Clarificação é determinística e segura — alta confiança para usar diretamente
+      confidence: 0.90,
       context: null,
     };
   }
@@ -276,12 +289,19 @@ function handleAnalyzeMode(input, options) {
     mode: 'analyze',
     input: input,
     output: null,
+    // Análise com contexto enriquecido — confiança baixa para exercitar inferência
+    confidence: 0.40,
     context: ANALYZE_EXTRA_CONTEXT,
   };
 }
 
 /**
  * Modo SOCIAL — conversa casual.
+ *
+ * Escala de confidence:
+ *   saudação pura           → 0.0  (neural sempre)
+ *   input vago (clarificação determinística) → 0.90 (usar diretamente)
+ *   input social com contexto → 0.45 (neural entra)
  */
 function handleSocialMode(input, options) {
   // Detecta se é saudação pura
@@ -290,6 +310,8 @@ function handleSocialMode(input, options) {
       mode: 'social',
       input: input,
       output: null, // deixa o modelo responder naturalmente
+      // Saudação: sem resposta direta, neural deve exercitar
+      confidence: 0.0,
       context: null,
     };
   }
@@ -302,6 +324,8 @@ function handleSocialMode(input, options) {
       mode: 'social',
       input: input,
       output: clarification,
+      // Clarificação determinística — alta confiança para usar diretamente
+      confidence: 0.90,
       context: null,
     };
   }
@@ -310,6 +334,8 @@ function handleSocialMode(input, options) {
     mode: 'social',
     input: input,
     output: null,
+    // Social com contexto: baixa confiança, neural deve processar
+    confidence: 0.45,
     context: AKIE_SYSTEM_CONTEXT,
   };
 }
