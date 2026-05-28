@@ -260,7 +260,7 @@ class AKIEModel {
       units: hiddenSize,
       activation: 'relu',
       name: 'ff_expand'
-    })(posEmbedded);
+    }).apply(posEmbedded);
 
     // Attention + projection
     const attended = new MultiHeadCausalAttention({
@@ -270,19 +270,19 @@ class AKIEModel {
     }).apply(ffExpanded);
 
     // Layer norm + dense para vocab
-    const normalized = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'layer_norm' })(attended);
+    const normalized = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'layer_norm' }).apply(attended);
     const projected = tf.layers.dense({
       units: vocabSize,
       activation: null,
       name: 'vocab_projection'
-    })(normalized);
+    }).apply(normalized);
 
     const lastToken = new ExtractLastToken({ name: 'extract_last' }).apply(projected);
     const output = tf.layers.dense({
       units: vocabSize,
       activation: 'softmax',
       name: 'output'
-    })(lastToken);
+    }).apply(lastToken);
 
     this.model = tf.model({ inputs: input, outputs: output });
     this.optimizer = tf.train.adam(this.hparams.learningRate);
