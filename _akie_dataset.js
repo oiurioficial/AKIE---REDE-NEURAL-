@@ -310,6 +310,10 @@ function graphSentencesToPairs(sentences, vocab) {
   const allPairs = [];
   const MAX_SEQ  = 64;
 
+  // Cap de pares por ciclo de consolidação: evita explosão de RAM/CPU no Railway.
+  // 80 frases × ~6 tokens/frase × teacher-forcing = ~480 pares máximo, processado em <15s.
+  const MAX_PAIRS_PER_CONSOLIDATION = 600;
+
   // Prefixos variados para reduzir overfitting no stub de pergunta
   const STUBS = [
     'u: o que é',
@@ -320,6 +324,8 @@ function graphSentencesToPairs(sentences, vocab) {
   ];
 
   for (let i = 0; i < sentences.length; i++) {
+    if (allPairs.length >= MAX_PAIRS_PER_CONSOLIDATION) break;
+
     const sentence = sentences[i];
     if (!sentence) continue;
 
@@ -337,6 +343,7 @@ function graphSentencesToPairs(sentences, vocab) {
 
     // Teacher-forcing por posição — formato idêntico ao SYNTHETIC e INTERACTIVE
     for (let pos = 1; pos < responseTokens.length; pos++) {
+      if (allPairs.length >= MAX_PAIRS_PER_CONSOLIDATION) break;
       const prefix    = responseTokens.slice(0, pos);
       const rawSeq    = [...contextTokens, ...prefix];
       const truncated = rawSeq.slice(-(MAX_SEQ - 1));
