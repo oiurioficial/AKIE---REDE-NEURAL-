@@ -195,23 +195,26 @@ const CONVERSATIONAL_SEED = [
 // ---------------------------------------------------------------------------
 
 const SOURCES = {
+  // Tatoeba: usa API pública /en/api_v0/search — sem download do CSV (512MB+).
+  // Busca frases PT-BR por query, pagina com cursor de índice, salva em arquivo local.
   TATOEBA: {
     name:   'tatoeba',
-    url:    null, // Download desativado — arquivo grande demais para contêiner 512MB
+    url:    null,  // sem download — busca por API
     file:   null,
     parsed: path.join(INGEST_DIR, 'tatoeba_sentences_pt.txt'),
     cursor: TATOEBA_CURSOR_FILE,
-    lang:   'pt',
+    lang:   'por', // código ISO 639-3 usado pela API Tatoeba
     maxAge: Infinity,
+    useApi: true,  // flag: usar fetchTatoebaApi em vez de file download
   },
   CONVERSATIONAL: {
     name:   'conversational',
-    url:    null, // sem download externo — banco local
+    url:    null,
     file:   null,
     parsed: path.join(INGEST_DIR, 'conversational_pt.txt'),
     cursor: CONV_CURSOR_FILE,
     lang:   'pt',
-    maxAge: Infinity, // não expira
+    maxAge: Infinity,
   },
 };
 
@@ -376,6 +379,79 @@ function normalizeSentence(sentence) {
  * Parseia sentences.csv e extrai frases PT e EN.
  * Formato: id\tlang\ttext
  */
+
+// ---------------------------------------------------------------------------
+// TATOEBA API — busca frases PT por query sem baixar o CSV completo
+// Endpoint: https://tatoeba.org/en/api_v0/search?from=por&sort=random&page=N
+// Cada página retorna ~10 frases. Paginamos de forma incremental usando cursor.
+// ---------------------------------------------------------------------------
+
+const TATOEBA_QUERIES = [
+  'bom dia', 'boa tarde', 'boa noite', 'obrigado', 'como vai',
+  'tudo bem', 'o que', 'como fazer', 'preciso de', 'pode me ajudar',
+  'não entendi', 'pode explicar', 'qual é', 'onde fica', 'quando foi',
+  'por que', 'quem é', 'quanto custa', 'como se chama', 'o que significa',
+  'isso é', 'isso não é', 'eu acho', 'eu preciso', 'eu quero',
+  'você sabe', 'você pode', 'me ajuda', 'me fala', 'tem como',
+];
+
+async function fetchTatoebaApi(batchSize) {
+  const sentences = [];
+  const queryCount = Math.min(3, TATOEBA_QUERIES.length);
+
+  for (let qi = 0; qi < queryCount; qi++) {
+    const query = TATOEBA_QUERIES[Math.floor(Math.random() * TATOEBA_QUERIES.length)];
+    const page  = Math.floor(Math.random() * 10) + 1; // páginas aleatórias
+
+    const url = `https://tatoeba.org/en/api_v0/search?from=por&query=${encodeURIComponent(query)}&sort=random&page=${page}`;
+
+    await new Promise((resolve) => {
+      const req = https.get(url, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'AKIE-Training-Bot/1.0 (educational; contact=dev)',
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            const results = json.results || [];
+            for (const item of results) {
+              const text = (item.text || '').trim();
+              if (text && isValidSentence(text)) {
+                sentences.push(normalizeSentence(text));
+              }
+              // Traduções também são válidas (pares PT/EN)
+              for (const tr of (item.translations || []).flat()) {
+                const ttext = (tr.text || '').trim();
+                if (ttext && isValidSentence(ttext)) {
+                  sentences.push(normalizeSentence(ttext));
+                }
+              }
+            }
+            console.log(`[TATOEBA-API] query="${query}" p=${page} → ${results.length} resultados`);
+          } catch (e) {
+            console.warn('[TATOEBA-API] parse error:', e.message);
+          }
+          resolve();
+        });
+      });
+      req.on('error', (e) => {
+        console.warn('[TATOEBA-API] request error:', e.message);
+        resolve();
+      });
+      req.setTimeout(8000, () => { req.destroy(); resolve(); });
+    });
+
+    // Pequena pausa entre queries para não sobrecarregar a API pública
+    await new Promise(r => setTimeout(r, 600));
+  }
+
+  return [...new Set(sentences)].slice(0, batchSize);
+}
+
 async function parseTatoeba(source) {
   const { file, parsed } = source;
 
@@ -597,7 +673,7 @@ async function runDataIngestion(vocab, options) {
 
   if (!ingestState.initialized) {
     ingestState.initialized = true;
-    console.log('[INGEST] Data Engine v3.0 iniciado (Wikipedia removida).');
+    console.log('[INGEST] Data Engine v3.1 iniciado (Tatoeba API + Serper ativo).');
     console.log(`[INGEST] Dir: ${INGEST_DIR} | Batch: ${batchSize} frases/ciclo`);
   }
 
@@ -620,24 +696,50 @@ async function runDataIngestion(vocab, options) {
     return { pairs: [], vocabGrowth: 0, sentences: 0 };
   }
 
-  // Se o arquivo parsed do Tatoeba não existir, redireciona para CONVERSATIONAL
-  if (source.name === 'tatoeba' && !fs.existsSync(source.parsed)) {
-    console.log('[INGEST] Tatoeba parsed não encontrado — usando CONVERSATIONAL como fallback.');
-    const convSource = SOURCES.CONVERSATIONAL;
-    await ensureConversationalFile(convSource);
-    const convCursor    = readCursor(convSource.cursor);
-    const convSentences = readBatch(convSource.parsed, convCursor, batchSize);
-    saveCursor(convSource.cursor, convCursor);
-    const filtered = convSentences.filter(isValidSentence);
-    const pairs    = sentencesToTrainingPairs(filtered, vocab);
-    const vocabGrowth = vocab.size - vocabBefore;
-    ingestState.stats.total_extracted += convSentences.length;
-    ingestState.stats.total_valid     += filtered.length;
-    ingestState.stats.total_inserted  += pairs.length;
-    ingestState.stats.last_run        = new Date().toISOString();
-    saveStats();
-    console.log(`[INGEST] conversational (fallback): ${filtered.length} frases → ${pairs.length} pares`);
-    return { pairs, vocabGrowth, sentences: filtered.length };
+  // Tatoeba via API (sem download do CSV)
+  if (source.name === 'tatoeba' && source.useApi) {
+    console.log('[INGEST] Tatoeba API: buscando frases PT-BR...');
+    try {
+      const apiSentences = await fetchTatoebaApi(batchSize);
+      if (apiSentences.length > 0) {
+        // Persiste em arquivo para reutilização no próximo ciclo
+        ensureDir(INGEST_DIR);
+        fs.appendFileSync(source.parsed, apiSentences.join('\n') + '\n');
+        const filtered = apiSentences.filter(isValidSentence);
+        const pairs    = sentencesToTrainingPairs(filtered, vocab);
+        const vocabGrowth = vocab.size - vocabBefore;
+        ingestState.stats.total_extracted += apiSentences.length;
+        ingestState.stats.total_valid     += filtered.length;
+        ingestState.stats.total_inserted  += pairs.length;
+        ingestState.stats.last_run        = new Date().toISOString();
+        saveStats();
+        console.log(`[INGEST] Tatoeba API: ${filtered.length} frases válidas → ${pairs.length} pares`);
+        return { pairs, vocabGrowth, sentences: filtered.length };
+      }
+    } catch (err) {
+      console.error('[INGEST] Tatoeba API falhou:', err.message);
+    }
+    // Fallback: lê do arquivo acumulado se existir
+    if (fs.existsSync(source.parsed)) {
+      console.log('[INGEST] Tatoeba: usando cache local acumulado.');
+    } else {
+      console.log('[INGEST] Tatoeba API indisponível — usando CONVERSATIONAL como fallback.');
+      const convSource = SOURCES.CONVERSATIONAL;
+      await ensureConversationalFile(convSource);
+      const convCursor    = readCursor(convSource.cursor);
+      const convSentences = readBatch(convSource.parsed, convCursor, batchSize);
+      saveCursor(convSource.cursor, convCursor);
+      const filtered = convSentences.filter(isValidSentence);
+      const pairs    = sentencesToTrainingPairs(filtered, vocab);
+      const vocabGrowth = vocab.size - vocabBefore;
+      ingestState.stats.total_extracted += convSentences.length;
+      ingestState.stats.total_valid     += filtered.length;
+      ingestState.stats.total_inserted  += pairs.length;
+      ingestState.stats.last_run        = new Date().toISOString();
+      saveStats();
+      console.log(`[INGEST] conversational (fallback): ${filtered.length} frases → ${pairs.length} pares`);
+      return { pairs, vocabGrowth, sentences: filtered.length };
+    }
   }
 
   const parsed = await ensureParsedFile(source);
