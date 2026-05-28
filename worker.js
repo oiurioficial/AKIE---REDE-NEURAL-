@@ -637,15 +637,14 @@ async function main() {
   process.on('SIGTERM', async () => {
     console.log('\n[WORKER] SIGTERM — aguardando conclusão do ciclo...');
 
-    // Espera o fit() em andamento terminar (máx 90s) antes de salvar
-    // Evita que o save capture pesos em estado intermediário do treinamento
+    // Espera fit() E save periódico terminarem antes de prosseguir.
+    // Matar o processo no meio de um model.save() gera shapes [,] no model.json.
     const deadline = Date.now() + 90_000;
-    while (_trainLock && Date.now() < deadline) {
+    while ((_trainLock || _saveLock) && Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
     }
-    if (_trainLock) {
-      console.warn('[WORKER] Timeout aguardando trainLock. Salvando mesmo assim.');
-    }
+    if (_trainLock) console.warn('[WORKER] Timeout aguardando trainLock.');
+    if (_saveLock)  console.warn('[WORKER] Timeout aguardando saveLock.');
 
     await safeSave();
 
