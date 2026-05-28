@@ -1,27 +1,18 @@
 /**
- * worker.js v2.1  —  AKIE Training Worker + HTTP Endpoint
+ * worker.js v2.2  —  AKIE Training Worker + HTTP Endpoint
  *
- * CORREÇÃO v2.1:
- *   [FIX-1] Firebase: .set({...}, {merge: true}) em vez de .update()
- *   [FIX-2] Scheduler: EXPANSION a cada 3 ciclos + novo modo SYNTHETIC
- *   [FIX-3] Injeção de dados conversacionais para destravar aprendizado
+ * CORREÇÕES v2.2:
+ *   [P1] MODE.INTERACTIVE agora treina com episodesToPairs() antes de marcar como queued
+ *   [P2] MODE.CONSOLIDATION detecta estagnação (delta < 0.005 por 3 ciclos) e redireciona para EXPANSION
+ *   [P4] /generate só usa behavior_direct quando behavior.confidence > 0.85
  *
- * UPGRADE MODERADO:
- *   embDim: 64 → 128
- *   hiddenSize: 128 → 256
- *   maxSeqLen: 32 → 64
- *   Parâmetros: ~260k → ~1.95M
+ * Herdado de v2.1:
+ *   [FIX-1] Firebase: .set({...}, {merge: true})
+ *   [FIX-2] Rotação SYNTHETIC/CONSOLIDATION/EXPANSION/SELF_PLAY
+ *   [FIX-3] Injeção de dados conversacionais sintéticos
  *
- * Roda 24h no Railway. Nunca para.
- * Expõe endpoint HTTP para o NEXUS chamar geração em tempo real.
- *
- *  ┌─────────────────────────────────────────────────────────────┐
- *  │  MODO 1 — INTERACTIVE  (usuário interagiu)                  │
- *  │  MODO 2 — CONSOLIDATION (replay do grafo semântico)         │
- *  │  MODO 3 — EXPANSION    (web crawl, lacunas do grafo)        │
- *  │  MODO 4 — SYNTHETIC    (injeção de dados conversacionais)   │
- *  │  MODO 5 — SELF_PLAY    (modelo gera e treina nos melhores)  │
- *  └─────────────────────────────────────────────────────────────┘
+ * Parâmetros do modelo:
+ *   embDim=128, hiddenSize=256, maxSeqLen=64  (~1.95M params)
  */
 
 require('dotenv').config();
@@ -48,11 +39,10 @@ const {
   getDefaultContext,
 } = require('./akie_behavior');
 
-// [FIX-2] Novo módulo de geração sintética
 const { generateSyntheticConversations } = require('./_akie_synthetic');
 
 // ---------------------------------------------------------------------------
-// Configuração com suporte a upgrade
+// Configuração
 // ---------------------------------------------------------------------------
 
 const CONFIG = {
@@ -60,18 +50,12 @@ const CONFIG = {
   modelDir: process.env.MODEL_DIR || '/data/akie_model',
   httpPort: parseInt(process.env.PORT || '3000', 10),
   saveEveryN: 5,
-  consolidationAfter: 1,
-  expansionAfter: 2,  // [FIX-2] reduzido de 3 para forçar EXPANSION a cada 3 ciclos
-  syntheticAfter: 1,  // [FIX-2] novo: injetar dados sintéticos frequentemente
-  selfPlayAfter: 2,
-  // Upgrade v2.0: novos limites refletindo maior capacidade
   generationLimits: {
-    social: { maxTokens: 80, temperature: 0.7 },
-    analyze: { maxTokens: 200, temperature: 0.5 },
-    code: { maxTokens: 600, temperature: 0.3 },
-    refino: { maxTokens: 120, temperature: 0.4 },
+    social:   { maxTokens: 80,  temperature: 0.7 },
+    analyze:  { maxTokens: 200, temperature: 0.5 },
+    code:     { maxTokens: 600, temperature: 0.3 },
+    refino:   { maxTokens: 120, temperature: 0.4 },
   },
-  // Hiperparâmetros do modelo v2.0
   hparams: {
     embDim: 128,
     hiddenSize: 256,
@@ -79,14 +63,21 @@ const CONFIG = {
     batchSize: 4,
     learningRate: 0.0005,
   },
+  // [P2] Limiar de estagnação para CONSOLIDATION
+  consolidation: {
+    stagnationDelta: 0.005,   // variação mínima de loss considerada progresso
+    stagnationCycles: 3,      // ciclos consecutivos abaixo do delta para disparar redirecionamento
+  },
+  // [P4] Limiar de confiança para usar behavior_direct
+  behaviorDirectConfidenceThreshold: 0.85,
 };
 
 const MODE = {
-  INTERACTIVE: 'INTERACTIVE',
+  INTERACTIVE:   'INTERACTIVE',
   CONSOLIDATION: 'CONSOLIDATION',
-  EXPANSION: 'EXPANSION',
-  SYNTHETIC: 'SYNTHETIC',      // [FIX-2] novo modo
-  SELF_PLAY: 'SELF_PLAY',
+  EXPANSION:     'EXPANSION',
+  SYNTHETIC:     'SYNTHETIC',
+  SELF_PLAY:     'SELF_PLAY',
 };
 
 // ---------------------------------------------------------------------------
@@ -108,6 +99,10 @@ const state = {
     lastLoss: null,
     lastAccuracy: null,
     trainCycles: 0,
+    // [P2] Rastreamento de estagnação na consolidação
+    consolidationLossDelta: null,       // delta do último ciclo de consolidação
+    consolidationStagnantCycles: 0,     // ciclos consecutivos estagnados
+    consolidationLastLoss: null,        // loss do ciclo anterior de consolidação
   },
   generationStats: {
     social: 0,
@@ -115,15 +110,16 @@ const state = {
     code: 0,
     refino: 0,
     direct: 0,
+    neural: 0,
   },
 };
 
 // ---------------------------------------------------------------------------
-// Mutexes de exclusão mútua
+// Mutexes
 // ---------------------------------------------------------------------------
 
 let _trainLock = false;
-let _saveLock = false;
+let _saveLock  = false;
 
 async function safeSave() {
   if (_saveLock) {
@@ -219,10 +215,13 @@ function startHttpServer() {
             refineryAvailable: false,
           });
 
-          console.log(`[GENERATE] Inferência | Modo: ${behavior.mode} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
+          console.log(`[GENERATE] Modo: ${behavior.mode} | Confidence: ${(behavior.confidence || 0).toFixed(2)} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
-          // Output direto
-          if (behavior.output) {
+          // [P4] Só usa output direto se confidence > threshold E output existe
+          const useDirectOutput = behavior.output &&
+            (behavior.confidence || 0) >= CONFIG.behaviorDirectConfidenceThreshold;
+
+          if (useDirectOutput) {
             state.generationStats.direct++;
             res.writeHead(200, headers);
             res.end(JSON.stringify({
@@ -230,12 +229,13 @@ function startHttpServer() {
               prompt: prompt,
               generated: behavior.output,
               mode: behavior.mode,
+              confidence: behavior.confidence,
               source: 'behavior_direct',
             }));
             return;
           }
 
-          // Inferência neural
+          // Inferência neural (cobre: sem output, confidence baixa, threshold não atingido)
           const modeLimits = CONFIG.generationLimits[behavior.mode] || CONFIG.generationLimits.social;
           const genMaxTokens = max_tokens || modeLimits.maxTokens;
           const genTemp = temperature || modeLimits.temperature;
@@ -243,11 +243,26 @@ function startHttpServer() {
           const generated = await state.model.generate(prompt, genMaxTokens, genTemp);
 
           if (!generated || generated.length === 0) {
+            // Fallback para behavior output parcial se existir
+            if (behavior.output) {
+              state.generationStats.direct++;
+              res.writeHead(200, headers);
+              res.end(JSON.stringify({
+                ok: true,
+                prompt: prompt,
+                generated: behavior.output,
+                mode: behavior.mode,
+                confidence: behavior.confidence,
+                source: 'behavior_fallback',
+              }));
+              return;
+            }
             res.writeHead(503, headers);
-            res.end(JSON.stringify({ error: 'Geração falhou — modelo pode estar treino/aquecimento.' }));
+            res.end(JSON.stringify({ error: 'Geração falhou — modelo em aquecimento.' }));
             return;
           }
 
+          state.generationStats.neural = (state.generationStats.neural || 0) + 1;
           state.generationStats[behavior.mode] = (state.generationStats[behavior.mode] || 0) + 1;
 
           res.writeHead(200, headers);
@@ -256,6 +271,7 @@ function startHttpServer() {
             prompt: prompt,
             generated: generated,
             mode: behavior.mode,
+            confidence: behavior.confidence,
             source: 'neural',
             tokens: generated.split(/\s+/).length,
           }));
@@ -299,15 +315,12 @@ async function init() {
     state.db = null;
   }
 
-  // Carregar ou criar vocabulário
   state.vocab = await loadOrCreateVocab();
   console.log(`[INIT] Vocabulário: ${state.vocab.size} tokens`);
 
-  // Criar modelo
   state.model = new AKIEModel(state.vocab, CONFIG.hparams);
-  console.log(`[INIT] Modelo criado com hparams: embDim=${CONFIG.hparams.embDim}, hiddenSize=${CONFIG.hparams.hiddenSize}, maxSeqLen=${CONFIG.hparams.maxSeqLen}`);
+  console.log(`[INIT] Modelo criado: embDim=${CONFIG.hparams.embDim}, hiddenSize=${CONFIG.hparams.hiddenSize}, maxSeqLen=${CONFIG.hparams.maxSeqLen}`);
 
-  // Tentar carregar modelo
   const loaded = await state.model.load(CONFIG.modelDir);
   if (!loaded) {
     console.log('[INIT] Nenhum modelo anterior — inicializando novo...');
@@ -317,7 +330,6 @@ async function init() {
 
   console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'}`);
 
-  // Seed conversacional — roda sempre que o grafo estiver pequeno (< 50 nós)
   if (state.db) {
     try {
       const graphSnap = await state.db.collection('nexus_graph').limit(50).get();
@@ -332,9 +344,6 @@ async function init() {
   }
 }
 
-/**
- * Detecta se um modelo carregado é incompatível e força reset
- */
 async function tryLoadModelFromBinary() {
   try {
     const metaPath = path.join(CONFIG.modelDir, 'akie_meta.json');
@@ -349,18 +358,16 @@ async function tryLoadModelFromBinary() {
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
     const loadedHparams = meta.hparams || {};
 
-    // Validar compatibilidade
     if (
-      loadedHparams.embDim !== CONFIG.hparams.embDim ||
+      loadedHparams.embDim     !== CONFIG.hparams.embDim ||
       loadedHparams.hiddenSize !== CONFIG.hparams.hiddenSize ||
-      loadedHparams.maxSeqLen !== CONFIG.hparams.maxSeqLen
+      loadedHparams.maxSeqLen  !== CONFIG.hparams.maxSeqLen
     ) {
       console.warn('\n╔══════════════════════════════════════════════════════════════╗');
-      console.warn('║  ⚠️  RESET AUTOMÁTICO DISPARADO                                ║');
+      console.warn('║  ⚠️  RESET AUTOMÁTICO DISPARADO                               ║');
       console.warn('╠══════════════════════════════════════════════════════════════╣');
       console.warn(`║  Carregado: [emb=${loadedHparams.embDim || 64} | hidden=${loadedHparams.hiddenSize || 128} | seq=${loadedHparams.maxSeqLen || 32}]`);
       console.warn(`║  Esperado:  [emb=${CONFIG.hparams.embDim} | hidden=${CONFIG.hparams.hiddenSize} | seq=${CONFIG.hparams.maxSeqLen}]`);
-      console.warn('║  → Removendo modelo antigo e inicializando novo...              ║');
       console.warn('╚══════════════════════════════════════════════════════════════╝\n');
 
       const bakPath = `${CONFIG.modelDir}_v1_backup`;
@@ -382,7 +389,6 @@ async function tryLoadModelFromBinary() {
       return true;
     }
 
-    // Compatível — carregar normalmente
     const loaded = await state.model.load(CONFIG.modelDir);
     state.modelLoadedFromBinary = true;
     return loaded || state.model.ready;
@@ -414,7 +420,6 @@ async function scheduler() {
     state.cycle++;
     console.log(`\n[CYCLE ${state.cycle}] ─────────────────────────────────────────`);
 
-    // Decidir modo
     let mode = MODE.INTERACTIVE;
     let episodes = [];
 
@@ -427,24 +432,29 @@ async function scheduler() {
     if (episodes.length > 0) {
       mode = MODE.INTERACTIVE;
     } else {
-      // [FIX-2] Rotação compactada para destravar aprendizado:
-      //   padrão de 4 ciclos: SYNTHETIC, CONSOLIDATION, EXPANSION, SELF_PLAY
+      // [P2] Se CONSOLIDATION está estagnada, forçar EXPANSION no próximo slot
+      const consolidationStuck =
+        state.metrics.consolidationStagnantCycles >= CONFIG.consolidation.stagnationCycles;
+
       const slot = (state.idleCycles % 4);
       if (slot === 0) {
-        mode = MODE.SYNTHETIC;        // Injeta dados conversacionais novos
+        mode = MODE.SYNTHETIC;
       } else if (slot === 1) {
-        mode = MODE.CONSOLIDATION;    // Aprende sobre grafo existente
+        // [P2] Pular CONSOLIDATION se estagnada, ir direto para EXPANSION
+        mode = consolidationStuck ? MODE.EXPANSION : MODE.CONSOLIDATION;
+        if (consolidationStuck) {
+          console.log(`[SCHEDULER] CONSOLIDATION estagnada (${state.metrics.consolidationStagnantCycles} ciclos) — redirecionando para EXPANSION`);
+          state.metrics.consolidationStagnantCycles = 0; // reset após redirecionar
+        }
       } else if (slot === 2) {
-        mode = MODE.EXPANSION;        // Web crawl + novos padrões
+        mode = MODE.EXPANSION;
       } else if (slot === 3) {
-        mode = MODE.SELF_PLAY;        // Auto-geração (se houver treino anterior)
+        mode = MODE.SELF_PLAY;
       }
     }
 
-    // Executar modo
     await runMode(mode, { tag: `[${state.cycle}]`, episodes });
 
-    // idleCycles conta ciclos consecutivos sem interação real de usuário
     if (episodes.length > 0) {
       state.idleCycles = 0;
     } else {
@@ -479,14 +489,58 @@ async function runMode(mode, ctx = {}) {
   console.log(`${tag} Modo: ${mode}`);
 
   switch (mode) {
+
+    // [P1] INTERACTIVE — agora treina antes de marcar episódios
     case MODE.INTERACTIVE: {
       await maybeExpandVocab(episodes);
-      await markEpisodesAsQueued(episodes);  // [FIX-1] agora sem NOT_FOUND
-      console.log(`${tag} INTERACTIVE: ${episodes.length} episódios enfileirados`);
+
+      pairs = episodesToPairs(episodes, state.vocab);
+      desc = `${episodes.length} episódios do usuário → ${pairs.length} pares`;
+
+      if (pairs.length === 0) {
+        console.log(`${tag} INTERACTIVE: nenhum par gerado a partir dos episódios`);
+        state.modeHistory.push(mode);
+        if (state.modeHistory.length > 20) state.modeHistory.shift();
+        return;
+      }
+
+      // Treinar antes de marcar como queued
+      shuffleArray(pairs);
+      _trainLock = true;
+      let result;
+      try {
+        result = await state.model.trainBatch(pairs, 3);
+      } catch (trainErr) {
+        console.error(`${tag} Erro durante trainBatch (INTERACTIVE):`, trainErr.message);
+      } finally {
+        _trainLock = false;
+      }
+
+      const { normLoss, normAcc } = extractMetrics(result);
+      const isFiniteNum = v => typeof v === 'number' && isFinite(v) && !isNaN(v);
+
+      state.metrics.lastLoss     = isFiniteNum(normLoss) ? normLoss : state.metrics.lastLoss;
+      state.metrics.lastAccuracy = isFiniteNum(normAcc)  ? normAcc  : state.metrics.lastAccuracy;
+      state.metrics.trainCycles++;
+      state.totalPairsTrained += pairs.length;
+
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      const lossStr = isFiniteNum(normLoss) ? normLoss.toFixed(4) : 'n/a';
+      const accStr  = isFiniteNum(normAcc)  ? (normAcc * 100).toFixed(1) + '%' : 'n/a';
+      console.log(`${tag} ✓ ${desc} | loss=${lossStr} acc=${accStr} | ${elapsed}s`);
+
+      // Só marcar como queued APÓS treino bem-sucedido
+      await markEpisodesAsQueued(episodes);
+
+      if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
+        await safeSave();
+      }
+
       state.modeHistory.push(mode);
       if (state.modeHistory.length > 20) state.modeHistory.shift();
       return;
     }
+
     case MODE.CONSOLIDATION: {
       const sentences = await fetchGraphSentences(state.db, 300);
       if (!sentences.length) {
@@ -497,6 +551,7 @@ async function runMode(mode, ctx = {}) {
       desc = `${sentences.length} frases do grafo → ${pairs.length} pares`;
       break;
     }
+
     case MODE.EXPANSION: {
       const vocabBefore = state.vocab.size;
       pairs = await fetchWebPatterns(state.db, state.vocab, 1);
@@ -507,13 +562,14 @@ async function runMode(mode, ctx = {}) {
       }
       break;
     }
-    // [FIX-2] Novo modo SYNTHETIC para injetar dados conversacionais
+
     case MODE.SYNTHETIC: {
       const syntheticPairs = await generateSyntheticConversations(state.vocab, 200);
       pairs = syntheticPairs;
       desc = `synthetic conversacional → ${pairs.length} pares`;
       break;
     }
+
     case MODE.SELF_PLAY: {
       pairs = await selfPlayPairs(state.model, state.db, state.vocab, 15);
       desc = `self-play → ${pairs.length} pares`;
@@ -534,16 +590,7 @@ async function runMode(mode, ctx = {}) {
       _trainLock = false;
     }
 
-    const safeResult = result || { loss: null, accuracy: null };
-
-    const rawLoss = safeResult.loss;
-    const rawAcc  = safeResult.accuracy;
-    const normLoss = (rawLoss != null && typeof rawLoss.dataSync === 'function')
-      ? rawLoss.dataSync()[0]
-      : rawLoss;
-    const normAcc  = (rawAcc != null && typeof rawAcc.dataSync === 'function')
-      ? rawAcc.dataSync()[0]
-      : rawAcc;
+    const { normLoss, normAcc } = extractMetrics(result);
     const isFiniteNum = v => typeof v === 'number' && isFinite(v) && !isNaN(v);
 
     state.metrics.lastLoss     = isFiniteNum(normLoss) ? normLoss : state.metrics.lastLoss;
@@ -551,10 +598,28 @@ async function runMode(mode, ctx = {}) {
     state.metrics.trainCycles++;
     state.totalPairsTrained += pairs.length;
 
+    // [P2] Rastrear estagnação de loss na CONSOLIDATION
+    if (mode === MODE.CONSOLIDATION && isFiniteNum(normLoss)) {
+      const prevLoss = state.metrics.consolidationLastLoss;
+      if (prevLoss !== null && prevLoss !== undefined) {
+        const delta = Math.abs(normLoss - prevLoss);
+        state.metrics.consolidationLossDelta = delta;
+
+        if (delta < CONFIG.consolidation.stagnationDelta) {
+          state.metrics.consolidationStagnantCycles++;
+          console.log(`${tag} [P2] Estagnação CONSOLIDATION: delta=${delta.toFixed(5)} | ciclos estagnados=${state.metrics.consolidationStagnantCycles}/${CONFIG.consolidation.stagnationCycles}`);
+        } else {
+          // Progresso real — resetar contador
+          state.metrics.consolidationStagnantCycles = 0;
+        }
+      }
+      state.metrics.consolidationLastLoss = normLoss;
+    }
+
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    const loss = isFiniteNum(normLoss) ? normLoss.toFixed(4) : 'n/a';
-    const acc  = isFiniteNum(normAcc)  ? (normAcc * 100).toFixed(1) + '%' : 'n/a';
-    console.log(`${tag} ✓ ${desc} | loss=${loss} acc=${acc} | ${elapsed}s`);
+    const lossStr = isFiniteNum(normLoss) ? normLoss.toFixed(4) : 'n/a';
+    const accStr  = isFiniteNum(normAcc)  ? (normAcc * 100).toFixed(1) + '%' : 'n/a';
+    console.log(`${tag} ✓ ${desc} | loss=${lossStr} acc=${accStr} | ${elapsed}s`);
 
     if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
       await safeSave();
@@ -568,13 +633,30 @@ async function runMode(mode, ctx = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: extrai loss/accuracy normalizados do resultado do trainBatch
+// ---------------------------------------------------------------------------
+
+function extractMetrics(result) {
+  const safeResult = result || { loss: null, accuracy: null };
+  const rawLoss = safeResult.loss;
+  const rawAcc  = safeResult.accuracy;
+  const normLoss = (rawLoss != null && typeof rawLoss.dataSync === 'function')
+    ? rawLoss.dataSync()[0]
+    : rawLoss;
+  const normAcc  = (rawAcc != null && typeof rawAcc.dataSync === 'function')
+    ? rawAcc.dataSync()[0]
+    : rawAcc;
+  return { normLoss, normAcc };
+}
+
+// ---------------------------------------------------------------------------
 // Utilidades de vocab e persistência
 // ---------------------------------------------------------------------------
 
 async function maybeExpandVocab(episodes) {
   const before = state.vocab.size;
   for (const ep of episodes) {
-    if (ep.input) state.vocab.addTokens(tokenizeText(ep.input));
+    if (ep.input)  state.vocab.addTokens(tokenizeText(ep.input));
     if (ep.output) state.vocab.addTokens(tokenizeText(ep.output));
   }
   if (state.vocab.size > before) {
@@ -584,7 +666,7 @@ async function maybeExpandVocab(episodes) {
 }
 
 async function maybeRebuildForVocabGrowth() {
-  const curr = state.vocab.size;
+  const curr    = state.vocab.size;
   const embSize = state.model.getStats().embeddingVocabSize;
   if (curr > embSize) {
     console.log(`[VOCAB] Expandindo embedding: ${embSize} → ${curr}`);
@@ -593,26 +675,25 @@ async function maybeRebuildForVocabGrowth() {
   }
 }
 
-// [FIX-1] CORREÇÃO CRÍTICA: use .set com merge em vez de .update
 async function markEpisodesAsQueued(episodes) {
   if (!state.db || !episodes.length) return;
   try {
     const batch = state.db.batch();
     for (const ep of episodes) {
       if (ep.id) {
-        // Usar .set({...}, {merge: true}) para criar se não existir
         batch.set(
           state.db.collection('user_episodes').doc(ep.id),
           {
             queued_for_consolidation: true,
             queued_at: new Date().toISOString(),
+            trained_at: new Date().toISOString(),
           },
           { merge: true }
         );
       }
     }
     await batch.commit();
-    console.log(`[EPISODES] Marcados ${episodes.length} episódios para consolidação`);
+    console.log(`[EPISODES] Marcados ${episodes.length} episódios como treinados`);
   } catch (err) {
     console.error('[EPISODES] Erro ao marcar episódios:', err.message);
   }
@@ -637,7 +718,10 @@ async function loadOrCreateVocab() {
 async function saveVocab(vocab) {
   try {
     fs.mkdirSync(CONFIG.modelDir, { recursive: true });
-    fs.writeFileSync(path.join(CONFIG.modelDir, 'akie_vocab.json'), JSON.stringify(vocab.toJSON(), null, 2));
+    fs.writeFileSync(
+      path.join(CONFIG.modelDir, 'akie_vocab.json'),
+      JSON.stringify(vocab.toJSON(), null, 2)
+    );
   } catch (e) {
     try {
       if (state.db) {
@@ -663,7 +747,7 @@ async function reportStatus(mode) {
       metrics: state.metrics,
       model_stats: state.model.getStats(),
       generation_stats: state.generationStats,
-      model_version: '2.1',  // [FIX] versão corrigida
+      model_version: '2.2',
     }, { merge: true });
   } catch (e) { /* não crítico */ }
 }
@@ -720,7 +804,7 @@ async function main() {
       await new Promise(r => setTimeout(r, 500));
     }
     if (_trainLock) console.warn('[WORKER] Timeout aguardando trainLock.');
-    if (_saveLock) console.warn('[WORKER] Timeout aguardando saveLock.');
+    if (_saveLock)  console.warn('[WORKER] Timeout aguardando saveLock.');
 
     await safeSave();
 
