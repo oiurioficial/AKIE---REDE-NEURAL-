@@ -89,12 +89,14 @@ const state = {
   vocab:             null,
   db:                null,
   modeHistory:       [],
+  // Flag explícita: modelo foi carregado do binário e está pronto para inferência
+  modelLoadedFromBinary: false,
   metrics: {
     lastLoss:        null,
     lastAccuracy:    null,
     trainCycles:     0,
   },
-  // NOVO: contadores de geração por modo
+  // Contadores de geração por modo
   generationStats: {
     social:  0,
     analyze: 0,
@@ -169,7 +171,7 @@ function startHttpServer() {
     }
 
     // ── POST /generate ─────────────────────────────────────────
-    // Chamado pelo NEXUS quando quer geração neural
+    // INFERÊNCIA PURA — NÃO executa treino, NÃO atualiza pesos.
     // Body: { prompt: string, max_tokens?: number, temperature?: number }
     if (req.method === 'POST' && req.url === '/generate') {
       let body = '';
@@ -184,21 +186,37 @@ function startHttpServer() {
             return;
           }
 
-          if (!state.model || !state.model.ready) {
+          // ── Garantir modelo carregado do binário (lazy load) ──
+          // Não recria modelo vazio — apenas carrega se ainda não estiver em memória
+          if (!state.model || !state.modelLoadedFromBinary) {
+            console.log('[GENERATE] Modelo não em memória — carregando do binário...');
+            const loaded = await tryLoadModelFromBinary();
+            if (!loaded) {
+              res.writeHead(503, headers);
+              res.end(JSON.stringify({
+                error: 'Modelo não disponível. weights.bin ausente ou corrompido.',
+                binary_path: path.join(CONFIG.modelDir, 'weights.bin'),
+              }));
+              return;
+            }
+          }
+
+          // Verificação de prontidão para inferência
+          if (!state.model.ready) {
             res.writeHead(503, headers);
-            res.end(JSON.stringify({ error: 'Modelo não está pronto ainda.' }));
+            res.end(JSON.stringify({ error: 'Modelo carregado mas não pronto para inferência.' }));
             return;
           }
 
-          // ── NOVO: Processar comportamento ANTES de gerar ──────
+          // ── Processar intenção (classificação apenas, sem treino) ──
           const behavior = processBehavior(prompt, {
             language: 'pt',
-            refineryAvailable: false, // sem Refinaria externa por enquanto
+            refineryAvailable: false,
           });
 
-          console.log(`[GENERATE] Modo: ${behavior.mode} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
+          console.log(`[GENERATE] Inferência | Modo: ${behavior.mode} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
-          // ── Se behavior tem output direto (refino/clarificação) ──
+          // ── Output direto do behavior engine (sem modelo neural) ──
           if (behavior.output) {
             state.generationStats.direct++;
             res.writeHead(200, headers);
@@ -212,37 +230,42 @@ function startHttpServer() {
             return;
           }
 
-          // ── Caso contrário: gerar com o modelo ────────────────
-          // Usar limites do modo detectado ou os fornecidos na requisição
+          // ── INFERÊNCIA com modelo carregado do weights.bin ────
+          // CRÍTICO: apenas model.generate() — zero trainBatch(), zero fit()
           const modeLimits = CONFIG.generationLimits[behavior.mode] || CONFIG.generationLimits.social;
           const finalMaxTokens   = max_tokens  || modeLimits.maxTokens;
           const finalTemperature = temperature || modeLimits.temperature;
 
-          // Construir prompt enriquecido com contexto do modo
           const enrichedPrompt = behavior.context
             ? `${behavior.context}\n\n[ENTRADA DO USUÁRIO]\n${behavior.input}`
             : behavior.input;
 
-          const generated = state.model.generate(
-            enrichedPrompt,
-            finalMaxTokens,
-            finalTemperature
-          );
+          let generated;
+          try {
+            generated = state.model.generate(enrichedPrompt, finalMaxTokens, finalTemperature);
+          } catch (genErr) {
+            console.error('[GENERATE] Falha na geração:', genErr.message);
+            res.writeHead(500, headers);
+            res.end(JSON.stringify({ error: `Falha na geração: ${genErr.message}` }));
+            return;
+          }
 
-          // Atualizar contadores
+          // Atualizar contadores de uso (não de treino)
           state.generationStats[behavior.mode] = (state.generationStats[behavior.mode] || 0) + 1;
 
-          // Marcar episódio para treino futuro (fire-and-forget)
+          // Persistir episódio para treino FUTURO (fire-and-forget)
+          // Treino acontece apenas em CONSOLIDATION/SELF_PLAY, nunca aqui
           saveGenerationEpisode(prompt, generated, behavior.mode).catch(() => {});
 
           res.writeHead(200, headers);
           res.end(JSON.stringify({
-            ok:        true,
-            prompt:    prompt,
-            generated: generated || '',
-            mode:      behavior.mode,
-            steps:     state.model.trainSteps,
-            source:    'model_generated',
+            ok:            true,
+            prompt:        prompt,
+            generated:     generated || '',
+            mode:          behavior.mode,
+            steps:         state.model.trainSteps,
+            source:        'model_inference',
+            binary_loaded: state.modelLoadedFromBinary,
           }));
 
         } catch (err) {
@@ -291,8 +314,82 @@ function startHttpServer() {
   return server;
 }
 
+// ---------------------------------------------------------------------------
+// Helpers de modelo e episódios
+// ---------------------------------------------------------------------------
+
+/**
+ * Carrega o modelo do binário (model.json + weights.bin) sem recriar do zero.
+ * Retorna true se carregado com sucesso, false caso contrário.
+ * Preserva o estado entre chamadas — se já estiver carregado, retorna imediatamente.
+ */
+async function tryLoadModelFromBinary() {
+  // Já carregado — não recarregar desnecessariamente
+  if (state.model && state.modelLoadedFromBinary && state.model.ready) {
+    return true;
+  }
+
+  const modelJsonPath  = path.join(CONFIG.modelDir, 'model.json');
+  const weightsBinPath = path.join(CONFIG.modelDir, 'weights.bin');
+
+  if (!fs.existsSync(modelJsonPath) || !fs.existsSync(weightsBinPath)) {
+    console.warn('[LOAD] Arquivos binários não encontrados:', { modelJsonPath, weightsBinPath });
+    return false;
+  }
+
+  try {
+    // Garantir vocab carregado antes do modelo
+    if (!state.vocab) {
+      state.vocab = await loadOrCreateVocab();
+    }
+
+    // Instanciar sem build() — load() reconstruirá com os pesos do binário
+    if (!state.model) {
+      state.model = new AKIEModel(state.vocab);
+    }
+
+    const loaded = await state.model.load(CONFIG.modelDir);
+    if (loaded) {
+      state.modelLoadedFromBinary = true;
+      console.log('[LOAD] Modelo carregado do binário com sucesso.');
+      return true;
+    }
+
+    console.warn('[LOAD] model.load() retornou false — binário pode estar corrompido.');
+    return false;
+
+  } catch (err) {
+    console.error('[LOAD] Erro ao carregar binário:', err.message);
+    return false;
+  }
+}
+
+/**
+ * Marca episódios como enfileirados para consolidação futura.
+ * Modo INTERACTIVE não treina — apenas registra para o próximo ciclo de CONSOLIDATION.
+ */
+async function markEpisodesAsQueued(episodes) {
+  if (!state.db || !episodes.length) return;
+  try {
+    const batch = state.db.batch();
+    for (const ep of episodes) {
+      if (ep._docId) {
+        const ref = state.db.collection('nexus_episodes').doc(ep._docId);
+        batch.update(ref, {
+          processed:    false,  // mantém disponível para CONSOLIDATION
+          queued_at:    new Date().toISOString(),
+          queued_mode:  'CONSOLIDATION',
+        });
+      }
+    }
+    await batch.commit();
+  } catch (e) {
+    // não crítico
+  }
+}
+
 // Salva geração como episódio para treino futuro
-// NOVO: inclui o modo detectado no episódio
+// Inclui o modo detectado no episódio
 async function saveGenerationEpisode(prompt, generated, mode) {
   if (!state.db || !generated) return;
   try {
@@ -344,23 +441,29 @@ async function init() {
     state.model = new AKIEModel(state.vocab);
     state.model.build();
     await state.model.save(CONFIG.modelDir);
+    // Após bootstrap o modelo é válido para inferência
+    state.modelLoadedFromBinary = true;
   }
 
   console.log(`[INIT] Vocabulário: ${state.vocab.size} tokens`);
 
-  // Modelo
+  // Modelo — carregar do binário (model.json + weights.bin)
   state.model = new AKIEModel(state.vocab);
   const loaded = await state.model.load(CONFIG.modelDir);
 
   if (!loaded) {
     console.log('[INIT] Nenhum modelo encontrado. Construindo novo...');
     await primeVocabulary(state.vocab, state.db);
-    // Re-executar bootstrap de vocab caso primeVocabulary tenha adicionado tokens
     state.model = new AKIEModel(state.vocab);
     state.model.build();
     await state.model.save(CONFIG.modelDir);
+    // Modelo recém-construído também é válido para inferência
+    state.modelLoadedFromBinary = true;
+    console.log('[INIT] Novo modelo construído e salvo em binário.');
   } else {
-    // Modelo carregado — verificar se vocab cresceu desde o último save
+    // Modelo carregado do binário (model.json + weights.bin)
+    state.modelLoadedFromBinary = true;
+    console.log('[INIT] Modelo carregado do binário. Pronto para inferência.');
     await maybeRebuildForVocabGrowth();
   }
 
@@ -412,6 +515,8 @@ async function scheduler() {
 
   try {
     // Prioridade 1: episódios reais de usuário
+    // IMPORTANTE: INTERACTIVE NÃO treina automaticamente.
+    // Episódios são expandidos no vocab e enfileirados para CONSOLIDATION futura.
     const episodes = await fetchUserEpisodes(state.db, 100);
     if (episodes.length > 0) {
       state.idleCycles = 0;
@@ -456,10 +561,15 @@ async function runMode(mode, ctx = {}) {
 
   switch (mode) {
     case MODE.INTERACTIVE: {
-      pairs = episodesToPairs(episodes, state.vocab);
-      desc  = `${episodes.length} episódios → ${pairs.length} pares`;
+      // MODO INTERACTIVE: NÃO treina. Apenas expande o vocab com novos tokens
+      // e marca episódios como processados para reaproveitamento em CONSOLIDATION.
+      // O treino só ocorre em modos explícitos: CONSOLIDATION, EXPANSION, SELF_PLAY.
       await maybeExpandVocab(episodes);
-      break;
+      await markEpisodesAsQueued(episodes);
+      console.log(`${tag} INTERACTIVE: ${episodes.length} episódios enfileirados para consolidação futura`);
+      state.modeHistory.push(mode);
+      if (state.modeHistory.length > 20) state.modeHistory.shift();
+      return; // sai sem chamar trainBatch
     }
     case MODE.CONSOLIDATION: {
       const sentences = await fetchGraphSentences(state.db, 300);
