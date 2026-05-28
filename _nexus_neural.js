@@ -3,16 +3,15 @@
  *
  * MUDANÇAS ESTRUTURAIS:
  *   embDim:    64 → 128     (2x)
- *   hiddenSize: 128 → 256   (2x)
+ *   hiddenSize: 128 → 256   (FFN interno dos blocos Transformer)
  *   maxSeqLen:  32 → 64     (2x contexto)
- *   
- * Parâmetros: ~260k → ~1.95M
- * RAM (Transformer Decoder): ~780MB (CPU-safe no Railway)
  *
- * COMPATIBILIDADE:
- *   - Versionamento de modelo (akie_meta.json)
- *   - Reset automático em incompatibilidade
- *   - Suporta migrações futuras sem falha crítica
+ * Parâmetros: ~260k → ~1.95M
+ *
+ * CORREÇÃO v2.0.1:
+ *   - Removido ff_expand mal posicionado antes da atenção (causava reshape inválido)
+ *   - Arquitetura Transformer Decoder correta: Embed → PosEmbed → [Norm → Attn → Res → Norm → FFN → Res] x2 → Norm → ExtractLast → Output
+ *   - MultiHeadCausalAttention agora recebe embDim correto em todos os caminhos
  */
 
 const tf = require('@tensorflow/tfjs-node');
@@ -21,7 +20,7 @@ const fs = require('fs');
 const { Vocabulary, makeTrainingPairs, SPECIAL } = require('./_akie_vocab');
 
 // ---------------------------------------------------------------------------
-// NLP Layer (unchanged)
+// NLP Layer
 // ---------------------------------------------------------------------------
 
 let NaturalNLP = null;
@@ -56,78 +55,114 @@ try {
   };
   console.log('[NLP] Biblioteca `natural` carregada.');
 } catch (e) {
-  NaturalNLP = { isReady: false, stem: t => t, stemSentence: s => s.split(/\s+/), similarity: () => 0, generationScore: () => 0, addDocument: () => {}, topTerms: () => [] };
+  NaturalNLP = {
+    isReady: false,
+    stem: t => t,
+    stemSentence: s => s.split(/\s+/),
+    similarity: () => 0,
+    generationScore: () => 0,
+    addDocument: () => {},
+    topTerms: () => [],
+  };
   console.log('[NLP] `natural` não encontrada.');
 }
 
 module.exports.NaturalNLP = NaturalNLP;
 
 // ---------------------------------------------------------------------------
-// Hiperparâmetros — UPGRADE MODERADO
+// Hiperparâmetros — v2.0
 // ---------------------------------------------------------------------------
 
 const HPARAMS = {
-  embDim:       128,      // ↑ 64 → 128
-  hiddenSize:   256,      // ↑ 128 → 256
-  maxSeqLen:    64,       // ↑ 32 → 64
-  batchSize:    4,       // mantém segurança RAM
-  learningRate: 0.0005,   // ↓ 0.001 → 0.0005 (maior modelo, LR conservador)
-  temperature:  0.8,
-  maxGenTokens: 40,
-  minNewData:   3,
-  beamSize:     3,
+  embDim:            128,   // dimensão dos embeddings (numHeads * headDim = 8 * 16)
+  hiddenSize:        256,   // FFN interno dos blocos (embDim * 2)
+  maxSeqLen:          64,   // comprimento máximo de contexto
+  batchSize:           4,   // batches pequenos para RAM limitada no Railway
+  learningRate:    0.0005,
+  temperature:       0.8,
+  maxGenTokens:       40,
+  minNewData:          3,
+  beamSize:            3,
   repetitionPenalty: 1.2,
-  modelVersion: '2.0',    // versão do modelo
+  modelVersion:     '2.0',
 };
 
 // ---------------------------------------------------------------------------
-// Camadas Customizadas (ajustadas para nova dimensionalidade)
+// Camadas Customizadas
 // ---------------------------------------------------------------------------
 
+/**
+ * Multi-Head Causal Attention.
+ * IMPORTANTE: espera entrada com última dimensão == embDim (não hiddenSize).
+ * numHeads=8, headDim=16 → embDim=128. Sempre consistente com HPARAMS.embDim.
+ */
 class MultiHeadCausalAttention extends tf.layers.Layer {
   constructor(config) {
     super(config || {});
-    this.numHeads = config.numHeads || 8;  // ↑ 4 → 8 heads (mais parallelismo)
-    this.headDim = config.headDim || 16;
-    this.embDim = this.numHeads * this.headDim;
+    this.numHeads = config.numHeads || 8;
+    this.headDim  = config.headDim  || 16;
+    this.embDim   = this.numHeads * this.headDim; // 8 * 16 = 128
   }
+
   build(inputShape) {
-    this.qDense = this.addWeight('q_proj', [this.embDim, this.embDim], 'float32', tf.initializers.glorotUniform());
-    this.kDense = this.addWeight('k_proj', [this.embDim, this.embDim], 'float32', tf.initializers.glorotUniform());
-    this.vDense = this.addWeight('v_proj', [this.embDim, this.embDim], 'float32', tf.initializers.glorotUniform());
+    this.qDense   = this.addWeight('q_proj',   [this.embDim, this.embDim], 'float32', tf.initializers.glorotUniform());
+    this.kDense   = this.addWeight('k_proj',   [this.embDim, this.embDim], 'float32', tf.initializers.glorotUniform());
+    this.vDense   = this.addWeight('v_proj',   [this.embDim, this.embDim], 'float32', tf.initializers.glorotUniform());
     this.outDense = this.addWeight('out_proj', [this.embDim, this.embDim], 'float32', tf.initializers.glorotUniform());
     this.built = true;
   }
+
   computeOutputShape(inputShape) { return inputShape; }
+
   call(inputs) {
     return tf.tidy(() => {
       const x = inputs[0] || inputs;
       const [batch, seqLen] = x.shape;
+
+      // x tem shape [batch, seqLen, embDim=128] — reshape seguro
       const xFlat = x.reshape([-1, this.embDim]);
+
       const q = xFlat.matMul(this.qDense.read()).reshape([batch, seqLen, this.numHeads, this.headDim]).transpose([0, 2, 1, 3]);
       const k = xFlat.matMul(this.kDense.read()).reshape([batch, seqLen, this.numHeads, this.headDim]).transpose([0, 2, 1, 3]);
       const v = xFlat.matMul(this.vDense.read()).reshape([batch, seqLen, this.numHeads, this.headDim]).transpose([0, 2, 1, 3]);
+
       let scores = q.matMul(k.transpose([0, 1, 3, 2])).div(tf.scalar(Math.sqrt(this.headDim)));
+
       const mask = tf.tidy(() => {
         const ones = tf.ones([seqLen, seqLen]);
         const tril = tf.linalg.bandPart(ones, -1, 0);
         return tf.where(tril.equal(1), tf.zeros([seqLen, seqLen]), tf.scalar(-1e9));
       });
       scores = scores.add(mask);
+
       const attentionProbs = tf.softmax(scores, -1);
       const context = attentionProbs.matMul(v).transpose([0, 2, 1, 3]).reshape([batch, seqLen, this.embDim]);
       const outFlat = context.reshape([-1, this.embDim]);
       return outFlat.matMul(this.outDense.read()).reshape([batch, seqLen, this.embDim]);
     });
   }
+
   static get className() { return 'MultiHeadCausalAttention'; }
 }
 tf.serialization.registerClass(MultiHeadCausalAttention);
 
+/**
+ * Positional Embedding treinável.
+ */
 class AddPositionalEmbedding extends tf.layers.Layer {
-  constructor(config) { super(config || {}); this.maxSeqLen = config.maxSeqLen; this.embDim = config.embDim; }
-  build(inputShape) { this.posEmbedding = this.addWeight('pos_embedding', [this.maxSeqLen, this.embDim], 'float32', tf.initializers.glorotUniform()); this.built = true; }
+  constructor(config) {
+    super(config || {});
+    this.maxSeqLen = config.maxSeqLen;
+    this.embDim    = config.embDim;
+  }
+
+  build(inputShape) {
+    this.posEmbedding = this.addWeight('pos_embedding', [this.maxSeqLen, this.embDim], 'float32', tf.initializers.glorotUniform());
+    this.built = true;
+  }
+
   computeOutputShape(inputShape) { return inputShape; }
+
   call(inputs) {
     return tf.tidy(() => {
       const tokenEmbeds = inputs[0] || inputs;
@@ -136,19 +171,20 @@ class AddPositionalEmbedding extends tf.layers.Layer {
       return tokenEmbeds.add(posEmbeds);
     });
   }
+
   static get className() { return 'AddPositionalEmbedding'; }
 }
 tf.serialization.registerClass(AddPositionalEmbedding);
 
-// ---------------------------------------------------------------------------
-// Embedding Customizado (compatível com tfjs 4.11.0+)
-// ---------------------------------------------------------------------------
-
+/**
+ * TokenEmbedding customizado (compatível com tfjs 4.x).
+ * Usa tf.gather em vez da camada Embedding nativa para evitar issues de dtype.
+ */
 class TokenEmbedding extends tf.layers.Layer {
   constructor(config) {
     super(config || {});
-    this.inputDim = config.inputDim;   // vocab size
-    this.outputDim = config.outputDim; // embedding dimension
+    this.inputDim    = config.inputDim;
+    this.outputDim   = config.outputDim;
     this.inputLength = config.inputLength;
   }
 
@@ -171,11 +207,7 @@ class TokenEmbedding extends tf.layers.Layer {
       const input = inputs[0] || inputs;
       const [batch, seqLen] = input.shape;
       const flatInput = input.reshape([-1]);
-      
-      // Gather: buscar embeddings para cada token
       const embedded = tf.gather(this.embeddings.read(), flatInput);
-      
-      // Reshape para [batch, seqLen, outputDim]
       return embedded.reshape([batch, seqLen, this.outputDim]);
     });
   }
@@ -184,8 +216,9 @@ class TokenEmbedding extends tf.layers.Layer {
 }
 tf.serialization.registerClass(TokenEmbedding);
 
-// ---------------------------------------------------------------------------
-
+/**
+ * Extrai o último token da sequência para predição autoregressiva.
+ */
 class ExtractLastToken extends tf.layers.Layer {
   constructor(config) { super(config || {}); }
   computeOutputShape(inputShape) { return [inputShape[0], inputShape[2]]; }
@@ -224,64 +257,90 @@ async function _copyDir(src, dst) {
 
 class AKIEModel {
   constructor(vocab, hparams = HPARAMS) {
-    this.vocab = vocab;
+    this.vocab   = vocab;
     this.hparams = { ...HPARAMS, ...hparams };
-    this.model = null;
+    this.model   = null;
     this.optimizer = null;
     this.trainSteps = 0;
-    this.ready = false;
+    this.ready   = false;
     this.embeddingVocabSize = 0;
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // build() — Transformer Decoder correto
+  //
+  // Fluxo:
+  //   input [batch, maxSeqLen int32]
+  //   → TokenEmbedding          → [batch, maxSeqLen, embDim=128]
+  //   → AddPositionalEmbedding  → [batch, maxSeqLen, 128]
+  //   ── Bloco 1 ──
+  //   → LayerNorm               → [batch, maxSeqLen, 128]
+  //   → MultiHeadCausalAttention → [batch, maxSeqLen, 128]
+  //   → Add (residual)          → [batch, maxSeqLen, 128]
+  //   → LayerNorm               → [batch, maxSeqLen, 128]
+  //   → Dense(hiddenSize=256, relu) → [batch, maxSeqLen, 256]
+  //   → Dense(embDim=128)       → [batch, maxSeqLen, 128]
+  //   → Add (residual)          → [batch, maxSeqLen, 128]
+  //   ── Bloco 2 (idêntico) ──
+  //   → LayerNorm final         → [batch, maxSeqLen, 128]
+  //   → ExtractLastToken        → [batch, 128]
+  //   → Dense(vocabSize, softmax) → [batch, vocabSize]
+  // ─────────────────────────────────────────────────────────────────────────
+
   build() {
-    const { embDim, maxSeqLen, hiddenSize } = this.hparams;
-    const vocabSize = this.vocab.size;
-    const numHeads = 8;  // ↑ aumentado de 4
-    const headDim = Math.floor(embDim / numHeads);
+    const { embDim, hiddenSize, maxSeqLen } = this.hparams;
+    const vocabSize = this.embeddingVocabSize > 0 ? this.embeddingVocabSize : this.vocab.size;
+    const numHeads  = 8;
+    const headDim   = Math.floor(embDim / numHeads); // 128 / 8 = 16
 
     const input = tf.input({ shape: [maxSeqLen], dtype: 'int32', name: 'context' });
-    
-    // Use TokenEmbedding customizado (compatível com tfjs 4.11.0+)
-    const embedding = new TokenEmbedding({
-      inputDim: vocabSize,
-      outputDim: embDim,
+
+    // 1. Token Embedding: [batch, maxSeqLen] → [batch, maxSeqLen, 128]
+    const tokenEmbedded = new TokenEmbedding({
+      inputDim:    vocabSize,
+      outputDim:   embDim,
       inputLength: maxSeqLen,
-      name: 'token_embedding'
+      name: 'token_embedding',
     }).apply(input);
 
-    const posEmbedded = new AddPositionalEmbedding({
+    // 2. Positional Embedding: soma posições → [batch, maxSeqLen, 128]
+    let x = new AddPositionalEmbedding({
       maxSeqLen,
       embDim,
-      name: 'pos_embedding'
-    }).apply(embedding);
+      name: 'pos_embedding',
+    }).apply(tokenEmbedded);
 
-    // Dense feed-forward expansion
-    const ffExpanded = tf.layers.dense({
-      units: hiddenSize,
-      activation: 'relu',
-      name: 'ff_expand'
-    }).apply(posEmbedded);
+    // ── Bloco Transformer Decoder 1 ──────────────────────────────────────
+    // Pre-norm → Atenção → Residual
+    const norm1_1 = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'norm1_1' }).apply(x);
+    const attn1   = new MultiHeadCausalAttention({ numHeads, headDim, name: 'attn_1' }).apply(norm1_1);
+    const res1    = tf.layers.add({ name: 'add1_1' }).apply([x, attn1]);
 
-    // Attention + projection
-    const attended = new MultiHeadCausalAttention({
-      numHeads,
-      headDim,
-      name: 'attention'
-    }).apply(ffExpanded);
+    // Pre-norm → FFN (embDim→hiddenSize→embDim) → Residual
+    const norm1_2 = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'norm1_2' }).apply(res1);
+    const ffn1_up = tf.layers.dense({ units: hiddenSize, activation: 'relu', name: 'ffn1_up' }).apply(norm1_2);
+    const ffn1_dn = tf.layers.dense({ units: embDim, name: 'ffn1_dn' }).apply(ffn1_up);
+    const block1  = tf.layers.add({ name: 'add1_2' }).apply([res1, ffn1_dn]);
 
-    // Layer norm + dense para vocab
-    const normalized = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'layer_norm' }).apply(attended);
-    const projected = tf.layers.dense({
-      units: vocabSize,
-      activation: null,
-      name: 'vocab_projection'
-    }).apply(normalized);
+    // ── Bloco Transformer Decoder 2 ──────────────────────────────────────
+    const norm2_1 = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'norm2_1' }).apply(block1);
+    const attn2   = new MultiHeadCausalAttention({ numHeads, headDim, name: 'attn_2' }).apply(norm2_1);
+    const res2    = tf.layers.add({ name: 'add2_1' }).apply([block1, attn2]);
 
-    const lastToken = new ExtractLastToken({ name: 'extract_last' }).apply(projected);
+    const norm2_2 = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'norm2_2' }).apply(res2);
+    const ffn2_up = tf.layers.dense({ units: hiddenSize, activation: 'relu', name: 'ffn2_up' }).apply(norm2_2);
+    const ffn2_dn = tf.layers.dense({ units: embDim, name: 'ffn2_dn' }).apply(ffn2_up);
+    const block2  = tf.layers.add({ name: 'add2_2' }).apply([res2, ffn2_dn]);
+
+    // 3. Normalização final + extração do último token
+    const finalNorm = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'final_norm' }).apply(block2);
+    const lastToken = new ExtractLastToken({ name: 'extract_last' }).apply(finalNorm);
+
+    // 4. Projeção para vocabulário com softmax
     const output = tf.layers.dense({
       units: vocabSize,
       activation: 'softmax',
-      name: 'output'
+      name: 'output',
     }).apply(lastToken);
 
     this.model = tf.model({ inputs: input, outputs: output });
@@ -292,8 +351,16 @@ class AKIEModel {
       metrics: ['accuracy'],
     });
 
-    console.log(`[AKIE] Modelo construído: embDim=${embDim}, hiddenSize=${hiddenSize}, maxSeqLen=${maxSeqLen}`);
+    this.ready = true;
+    if (this.embeddingVocabSize === 0) this.embeddingVocabSize = vocabSize;
+
+    console.log(`[AKIE] Transformer v2.0 construído: embDim=${embDim}, hiddenSize=${hiddenSize}, maxSeqLen=${maxSeqLen}, vocab=${vocabSize}, params=${this.model.countParams().toLocaleString()}`);
+    return this;
   }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // trainBatch — loop manual por mini-batch (RAM-safe com batchSize=4)
+  // ─────────────────────────────────────────────────────────────────────────
 
   async trainBatch(pairs, epochs = 3) {
     if (!this.ready || !pairs.length) return { loss: null, accuracy: null };
@@ -315,20 +382,19 @@ class AKIEModel {
         let result;
         try {
           result = this.model.trainOnBatch(xs, ys);
-          // trainOnBatch pode retornar Promise ou valor direto
           if (result && typeof result.then === 'function') result = await result;
         } finally {
           xs.dispose();
           ys.dispose();
         }
 
-        // result pode ser: number, number[], Tensor, ou array de Tensors
         const _toNum = (v) => {
           if (v == null) return null;
           if (typeof v === 'number') return isFinite(v) ? v : null;
           if (Array.isArray(v)) return _toNum(v[0]);
           if (typeof v.dataSync === 'function') {
-            try { const s = v.dataSync()[0]; v.dispose?.(); return isFinite(s) ? s : null; } catch { return null; }
+            try { const s = v.dataSync()[0]; v.dispose?.(); return isFinite(s) ? s : null; }
+            catch { return null; }
           }
           return null;
         };
@@ -348,47 +414,50 @@ class AKIEModel {
     return { loss, accuracy };
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // generate — Beam Search com penalização de repetição
+  // ─────────────────────────────────────────────────────────────────────────
+
   async generate(prompt, maxTokens = null, temperature = null) {
     if (!this.ready) return '';
 
-    maxTokens = maxTokens || this.hparams.maxGenTokens;
+    maxTokens   = maxTokens   || this.hparams.maxGenTokens;
     temperature = temperature || this.hparams.temperature;
 
-    const { tokenize, PAD, BOS, EOS } = this.vocab;
-    const ids = this.vocab.tokenize(prompt);
-
+    const ids   = this.vocab.tokenize(prompt);
     const beams = [{ ids: ids.slice(-this.hparams.maxSeqLen), logProb: 0 }];
 
     for (let step = 0; step < maxTokens; step++) {
       const nextBeams = [];
 
       for (const beam of beams) {
-        const seqTensor = tf.tensor2d([
-          [
-            ...Array(Math.max(0, this.hparams.maxSeqLen - beam.ids.length)).fill(SPECIAL.PAD),
-            ...beam.ids
-          ].slice(-this.hparams.maxSeqLen)
-        ], [1, this.hparams.maxSeqLen], 'int32');
+        const padded = [
+          ...Array(Math.max(0, this.hparams.maxSeqLen - beam.ids.length)).fill(SPECIAL.PAD),
+          ...beam.ids,
+        ].slice(-this.hparams.maxSeqLen);
 
-        const logits = this.model.predict(seqTensor);
+        const seqTensor = tf.tensor2d([padded], [1, this.hparams.maxSeqLen], 'int32');
+        const logits    = this.model.predict(seqTensor);
         const logitsData = logits.dataSync();
         seqTensor.dispose();
         logits.dispose();
 
-        const probs = Array.from(logitsData).map((l, i) => ({
-          id: i,
-          logprob: Math.log(Math.max(1e-10, l / temperature))
-        }));
+        // Penalização de repetição
+        const seenSet = new Set(beam.ids);
+        const probs = Array.from(logitsData).map((l, i) => {
+          let adj = l;
+          if (seenSet.has(i)) adj = adj > 0 ? adj / this.hparams.repetitionPenalty : adj * this.hparams.repetitionPenalty;
+          return { id: i, logprob: Math.log(Math.max(1e-10, adj / temperature)) };
+        });
 
         probs.sort((a, b) => b.logprob - a.logprob);
 
         for (let k = 0; k < this.hparams.beamSize && k < probs.length; k++) {
           const nextId = probs[k].id;
-          const newIds = [...beam.ids, nextId];
-          const newLogProb = beam.logProb + probs[k].logprob;
-
-          nextBeams.push({ ids: newIds, logProb: newLogProb, generatedIds: newIds });
-
+          nextBeams.push({
+            ids:     [...beam.ids, nextId],
+            logProb: beam.logProb + probs[k].logprob,
+          });
           if (nextId === SPECIAL.EOS) break;
         }
       }
@@ -397,11 +466,14 @@ class AKIEModel {
       beams.splice(0, beams.length, ...nextBeams.slice(0, this.hparams.beamSize));
     }
 
-    const bestBeam = beams.reduce((best, beam) => beam.logProb > best.logProb ? beam : best, beams[0]);
-    const outputTokens = bestBeam.ids.filter(id => id !== SPECIAL.EOS && id !== SPECIAL.PAD && id !== SPECIAL.BOS);
-    if (outputTokens.length === 0) return '';
-    return this.vocab.detokenize(outputTokens);
+    const best = beams.reduce((b, c) => c.logProb > b.logProb ? c : b, beams[0]);
+    const out  = best.ids.filter(id => id !== SPECIAL.EOS && id !== SPECIAL.PAD && id !== SPECIAL.BOS);
+    return out.length ? this.vocab.detokenize(out) : '';
   }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Persistência — salva pesos em binário customizado (mais rápido que tf.LayersModel save)
+  // ─────────────────────────────────────────────────────────────────────────
 
   async save(dir) {
     if (!this.ready) return;
@@ -412,12 +484,12 @@ class AKIEModel {
     await fs.promises.rm(tmpDir, { recursive: true, force: true });
     await fs.promises.mkdir(tmpDir, { recursive: true });
 
-    const weights = this.model.getWeights();
-    const manifest = weights.map(w => ({ name: w.name, shape: w.shape }));
-    const allData = weights.map(w => w.dataSync());
-
+    const weights   = this.model.getWeights();
+    const manifest  = weights.map(w => ({ name: w.name, shape: w.shape }));
+    const allData   = weights.map(w => w.dataSync());
     const totalFloats = allData.reduce((sum, arr) => sum + arr.length, 0);
-    const buffer = Buffer.allocUnsafe(totalFloats * 4);
+    const buffer    = Buffer.allocUnsafe(totalFloats * 4);
+
     let offset = 0;
     for (const arr of allData) {
       for (const v of arr) { buffer.writeFloatLE(v, offset); offset += 4; }
@@ -427,13 +499,13 @@ class AKIEModel {
     await fs.promises.writeFile(path.join(tmpDir, 'weights.bin'), buffer);
 
     const meta = {
-      trainSteps: this.trainSteps,
-      vocabSize: this.vocab.size,
+      trainSteps:         this.trainSteps,
+      vocabSize:          this.vocab.size,
       embeddingVocabSize: this.embeddingVocabSize,
-      hparams: this.hparams,
-      savedAt: new Date().toISOString(),
-      format: 'weights_bin_v2',  // ← versão 2.0
-      modelVersion: this.hparams.modelVersion,
+      hparams:            this.hparams,
+      savedAt:            new Date().toISOString(),
+      format:             'weights_bin_v2',
+      modelVersion:       this.hparams.modelVersion,
     };
     await fs.promises.writeFile(path.join(tmpDir, 'akie_meta.json'), JSON.stringify(meta, null, 2));
     await fs.promises.writeFile(path.join(tmpDir, 'akie_vocab.json'), JSON.stringify(this.vocab.toJSON(), null, 2));
@@ -449,68 +521,60 @@ class AKIEModel {
     console.log(`[AKIE] ✓ Modelo v2.0 salvo em ${dir} (steps: ${this.trainSteps})`);
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // load — carrega binário com validação de compatibilidade
+  // ─────────────────────────────────────────────────────────────────────────
+
   async load(dir) {
     const bakDir = `${dir}_bak`;
 
     for (const tryDir of [dir, bakDir]) {
-      const metaPath = path.join(tryDir, 'akie_meta.json');
+      const metaPath     = path.join(tryDir, 'akie_meta.json');
       const manifestPath = path.join(tryDir, 'weight_manifest.json');
-      const weightsPath = path.join(tryDir, 'weights.bin');
+      const weightsPath  = path.join(tryDir, 'weights.bin');
 
       if (!fs.existsSync(metaPath) || !fs.existsSync(manifestPath) || !fs.existsSync(weightsPath)) {
         const files = fs.existsSync(tryDir) ? fs.readdirSync(tryDir) : [];
-        console.log(`[AKIE] Procurando em: ${path.join(tryDir, 'weights.bin')}`);
-        console.log(`[AKIE] Arquivos: ${files.join(', ') || 'nenhum'}`);
+        console.log(`[AKIE] Sem modelo em ${tryDir}. Arquivos: ${files.join(', ') || 'nenhum'}`);
         continue;
       }
 
       try {
-        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+        const meta     = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
         const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
-        // ┌─ VALIDAÇÃO DE COMPATIBILIDADE ─┐
-        const loadedVersion = meta.modelVersion || meta.hparams?.modelVersion || '1.0';
-        const loadedEmbDim = meta.hparams?.embDim || 64;
-        const loadedHiddenSize = meta.hparams?.hiddenSize || 128;
-        const loadedMaxSeqLen = meta.hparams?.maxSeqLen || 32;
-
-        const expectedEmbDim = this.hparams.embDim;
-        const expectedHiddenSize = this.hparams.hiddenSize;
-        const expectedMaxSeqLen = this.hparams.maxSeqLen;
+        // Validação de compatibilidade de arquitetura
+        const savedEmbDim    = meta.hparams?.embDim    || 64;
+        const savedHidden    = meta.hparams?.hiddenSize || 128;
+        const savedMaxSeqLen = meta.hparams?.maxSeqLen  || 32;
 
         if (
-          loadedEmbDim !== expectedEmbDim ||
-          loadedHiddenSize !== expectedHiddenSize ||
-          loadedMaxSeqLen !== expectedMaxSeqLen
+          savedEmbDim    !== this.hparams.embDim    ||
+          savedHidden    !== this.hparams.hiddenSize ||
+          savedMaxSeqLen !== this.hparams.maxSeqLen
         ) {
-          console.warn('\n╔══════════════════════════════════════════════════════════════╗');
-          console.warn('║  ⚠️  INCOMPATIBILIDADE DE MODELO DETECTADA                      ║');
-          console.warn('╠══════════════════════════════════════════════════════════════╣');
-          console.warn(`║  Carregado: v${loadedVersion} [emb=${loadedEmbDim} | hidden=${loadedHiddenSize} | seq=${loadedMaxSeqLen}]`);
-          console.warn(`║  Esperado:  v${this.hparams.modelVersion} [emb=${expectedEmbDim} | hidden=${expectedHiddenSize} | seq=${expectedMaxSeqLen}]`);
-          console.warn('║  → Reinicializando modelo com nova arquitetura...               ║');
-          console.warn('╚══════════════════════════════════════════════════════════════╝\n');
-          
-          // Forçar reset
+          console.warn(`[AKIE] ⚠️  Incompatibilidade: salvo=[emb=${savedEmbDim}|hid=${savedHidden}|seq=${savedMaxSeqLen}] vs atual=[emb=${this.hparams.embDim}|hid=${this.hparams.hiddenSize}|seq=${this.hparams.maxSeqLen}]`);
+          console.warn('[AKIE] → Reinicializando com nova arquitetura...');
           this.build();
-          this.ready = true;
           return false;
         }
 
-        this.trainSteps = meta.trainSteps || 0;
+        this.trainSteps         = meta.trainSteps || 0;
         this.embeddingVocabSize = meta.embeddingVocabSize || meta.vocabSize || this.vocab.size;
 
-        const buildVocab = { ...this.vocab, size: this.embeddingVocabSize };
-        const shell = new AKIEModel(buildVocab, this.hparams);
+        // Construir shell com vocab do tamanho salvo para carregar pesos corretamente
+        const shellVocab = { ...this.vocab, size: this.embeddingVocabSize };
+        const shell = new AKIEModel(shellVocab, this.hparams);
+        shell.embeddingVocabSize = this.embeddingVocabSize;
         shell.build();
 
-        const buffer = fs.readFileSync(weightsPath);
-        let offset = 0;
+        const buffer  = fs.readFileSync(weightsPath);
+        let bufOffset = 0;
         const tensors = manifest.map(w => {
           const numFloats = w.shape.reduce((a, b) => a * b, 1);
           const arr = new Float32Array(numFloats);
           for (let i = 0; i < numFloats; i++) {
-            arr[i] = buffer.readFloatLE(offset); offset += 4;
+            arr[i] = buffer.readFloatLE(bufOffset); bufOffset += 4;
           }
           return tf.tensor(arr, w.shape, 'float32');
         });
@@ -529,12 +593,11 @@ class AKIEModel {
 
         if (tryDir === bakDir) {
           console.warn(`[AKIE] ✓ Recuperado do backup. (steps: ${this.trainSteps})`);
-          await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
-          await _copyDir(bakDir, dir);
         } else {
           console.log(`[AKIE] ✓ Transformer v2.0 carregado. (steps: ${this.trainSteps}, embVocab: ${this.embeddingVocabSize})`);
         }
 
+        // Expandir se vocab cresceu desde o último save
         if (this.vocab.size > this.embeddingVocabSize) {
           console.log(`[AKIE] Vocab cresceu (${this.embeddingVocabSize} → ${this.vocab.size}). Expandindo...`);
           await this.expandVocabulary(this.vocab.size);
@@ -550,57 +613,72 @@ class AKIEModel {
       }
     }
 
-    console.log('[AKIE] ✗ Nenhum arquivo de modelo encontrado. Inicializando novo...');
+    console.log('[AKIE] ✗ Nenhum modelo encontrado. Inicializando novo...');
     this.build();
-    this.ready = true;
     return false;
   }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // expandVocabulary — redimensiona embedding e output preservando pesos
+  // ─────────────────────────────────────────────────────────────────────────
 
   async expandVocabulary(newVocabSize) {
     if (!this.ready) return;
     if (newVocabSize <= this.embeddingVocabSize) return;
-    console.log(`[AKIE] Reconfigurando vocabulário: ${this.embeddingVocabSize} → ${newVocabSize}`);
+
+    console.log(`[AKIE] Expandindo vocab: ${this.embeddingVocabSize} → ${newVocabSize}`);
 
     const oldWeights = this.model.getWeights();
     this.embeddingVocabSize = newVocabSize;
     this.build();
 
     const newWeights = this.model.getWeights();
-    const updatedWeights = newWeights.map((w, i) => {
+    const updated = newWeights.map((w, i) => {
       const oldW = oldWeights[i];
-      if (!oldW) { console.warn(`[AKIE] Peso ${i} não encontrado.`); return w; }
-      const oldShape = oldW.shape, newShape = w.shape;
-      if (oldShape.length === newShape.length && oldShape.every((d, idx) => d === newShape[idx])) return oldW;
-      if (oldShape.length === 2 && newShape.length === 2 && newShape[0] > oldShape[0] && oldShape[1] === newShape[1]) {
-        const merged = new Float32Array(w.dataSync()); merged.set(oldW.dataSync()); return tf.tensor(merged, newShape, 'float32');
+      if (!oldW) return w;
+      const os = oldW.shape, ns = w.shape;
+      if (JSON.stringify(os) === JSON.stringify(ns)) return oldW;
+
+      // Embedding: [vocabSize, embDim] — linha a linha
+      if (os.length === 2 && ns.length === 2 && ns[0] > os[0] && os[1] === ns[1]) {
+        const merged = new Float32Array(w.dataSync());
+        merged.set(oldW.dataSync());
+        return tf.tensor(merged, ns, 'float32');
       }
-      if (oldShape.length === 2 && newShape.length === 2 && newShape[1] > oldShape[1] && oldShape[0] === newShape[0]) {
+      // Output Dense kernel: [embDim, vocabSize]
+      if (os.length === 2 && ns.length === 2 && ns[1] > os[1] && os[0] === ns[0]) {
         const oldData = oldW.dataSync(), merged = new Float32Array(w.dataSync());
-        const [rows, oldCols] = oldShape, newCols = newShape[1];
-        for (let r = 0; r < rows; r++) for (let c = 0; c < oldCols; c++) merged[r * newCols + c] = oldData[r * oldCols + c];
-        return tf.tensor(merged, newShape, 'float32');
+        const [rows, oldCols] = os, newCols = ns[1];
+        for (let r = 0; r < rows; r++)
+          for (let c = 0; c < oldCols; c++)
+            merged[r * newCols + c] = oldData[r * oldCols + c];
+        return tf.tensor(merged, ns, 'float32');
       }
-      if (oldShape.length === 1 && newShape.length === 1 && newShape[0] > oldShape[0]) {
-        const merged = new Float32Array(w.dataSync()); merged.set(oldW.dataSync()); return tf.tensor(merged, newShape, 'float32');
+      // Output Dense bias: [vocabSize]
+      if (os.length === 1 && ns.length === 1 && ns[0] > os[0]) {
+        const merged = new Float32Array(w.dataSync());
+        merged.set(oldW.dataSync());
+        return tf.tensor(merged, ns, 'float32');
       }
-      console.warn(`[AKIE] Peso ${i}: forma incompatível ${oldShape} → ${newShape}`);
+
       return w;
     });
-    this.model.setWeights(updatedWeights);
+
+    this.model.setWeights(updated);
     oldWeights.forEach(w => { try { w.dispose(); } catch {} });
-    console.log('[AKIE] ✓ Expansão concluída.');
+    console.log('[AKIE] ✓ Expansão de vocab concluída.');
   }
 
   getStats() {
     return {
-      architecture: 'Causal Transformer Decoder v2.0',
-      ready: this.ready,
-      vocabSize: this.vocab.size,
+      architecture:       'Causal Transformer Decoder v2.0',
+      ready:              this.ready,
+      vocabSize:          this.vocab.size,
       embeddingVocabSize: this.embeddingVocabSize,
-      trainSteps: this.trainSteps,
-      parameters: this.ready ? this.model.countParams() : 0,
-      hparams: this.hparams,
-      nlp: { natural: NaturalNLP.isReady },
+      trainSteps:         this.trainSteps,
+      parameters:         this.ready ? this.model.countParams() : 0,
+      hparams:            this.hparams,
+      nlp:                { natural: NaturalNLP.isReady },
     };
   }
 
