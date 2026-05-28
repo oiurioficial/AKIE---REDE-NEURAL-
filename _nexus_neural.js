@@ -253,36 +253,36 @@ class AKIEModel {
       maxSeqLen,
       embDim,
       name: 'pos_embedding'
-    }).apply(embedding);
+    })(embedding);
 
     // Dense feed-forward expansion
     const ffExpanded = tf.layers.dense({
       units: hiddenSize,
       activation: 'relu',
       name: 'ff_expand'
-    }).apply(posEmbedded);
+    })(posEmbedded);
 
     // Attention + projection
     const attended = new MultiHeadCausalAttention({
       numHeads,
       headDim,
       name: 'attention'
-    }).apply(ffExpanded);
+    })(ffExpanded);
 
     // Layer norm + dense para vocab
-    const normalized = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'layer_norm' }).apply(attended);
+    const normalized = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'layer_norm' })(attended);
     const projected = tf.layers.dense({
       units: vocabSize,
       activation: null,
       name: 'vocab_projection'
-    }).apply(normalized);
+    })(normalized);
 
-    const lastToken = new ExtractLastToken({ name: 'extract_last' }).apply(projected);
+    const lastToken = new ExtractLastToken({ name: 'extract_last' })(projected);
     const output = tf.layers.dense({
       units: vocabSize,
       activation: 'softmax',
       name: 'output'
-    }).apply(lastToken);
+    })(lastToken);
 
     this.model = tf.model({ inputs: input, outputs: output });
     this.optimizer = tf.train.adam(this.hparams.learningRate);
@@ -311,8 +311,23 @@ class AKIEModel {
       verbose: 0,
     });
 
-    const loss = history.history.loss[history.history.loss.length - 1];
-    const accuracy = history.history.acc ? history.history.acc[history.history.acc.length - 1] : null;
+    // fitDataset pode retornar Tensor em vez de scalar — extrair valor JS seguro
+    const _extractScalar = (v) => {
+      if (v == null) return null;
+      if (typeof v === 'number') return isFinite(v) && !isNaN(v) ? v : null;
+      if (typeof v.dataSync === 'function') {
+        try { const s = v.dataSync()[0]; return isFinite(s) && !isNaN(s) ? s : null; } catch { return null; }
+      }
+      if (typeof v.arraySync === 'function') {
+        try { const s = v.arraySync(); return isFinite(s) && !isNaN(s) ? s : null; } catch { return null; }
+      }
+      return null;
+    };
+
+    const rawLoss = history.history.loss[history.history.loss.length - 1];
+    const rawAcc  = history.history.acc ? history.history.acc[history.history.acc.length - 1] : null;
+    const loss     = _extractScalar(rawLoss);
+    const accuracy = _extractScalar(rawAcc);
 
     this.trainSteps += pairs.length * epochs;
     return { loss, accuracy };
