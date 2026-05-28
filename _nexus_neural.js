@@ -83,7 +83,7 @@ const HPARAMS = {
   maxGenTokens:       40,
   minNewData:          3,
   beamSize:            3,
-  repetitionPenalty: 1.2,
+  repetitionPenalty: 2.5,
   modelVersion:     '2.0',
 };
 
@@ -427,40 +427,88 @@ class AKIEModel {
     temperature = temperature || this.hparams.temperature;
 
     const ids   = this.vocab.tokenize(prompt);
-    const beams = [{ ids: ids.slice(-this.hparams.maxSeqLen), logProb: 0 }];
+    const beams = [{ ids: ids.slice(-this.hparams.maxSeqLen), logProb: 0, finished: false }];
+
+    // Extrai n-gramas (n=2 e n=3) de uma sequência de ids para penalidade de repetição estrutural.
+    // Retorna um Set de strings "id1,id2[,id3]" representando n-gramas já vistos.
+    const _buildNgramSet = (sequence, n) => {
+      const s = new Set();
+      for (let i = 0; i <= sequence.length - n; i++) {
+        s.add(sequence.slice(i, i + n).join(','));
+      }
+      return s;
+    };
 
     for (let step = 0; step < maxTokens; step++) {
+      // Se todos os beams já terminaram em EOS, encerra cedo.
+      if (beams.every(b => b.finished)) break;
+
       const nextBeams = [];
 
       for (const beam of beams) {
+        // Beam finalizado — mantém sem expandir (preserva o melhor caminho encerrado)
+        if (beam.finished) {
+          nextBeams.push(beam);
+          continue;
+        }
+
         const padded = [
           ...Array(Math.max(0, this.hparams.maxSeqLen - beam.ids.length)).fill(SPECIAL.PAD),
           ...beam.ids,
         ].slice(-this.hparams.maxSeqLen);
 
-        const seqTensor = tf.tensor2d([padded], [1, this.hparams.maxSeqLen], 'int32');
-        const logits    = this.model.predict(seqTensor);
+        const seqTensor  = tf.tensor2d([padded], [1, this.hparams.maxSeqLen], 'int32');
+        const logits     = this.model.predict(seqTensor);
         const logitsData = logits.dataSync();
         seqTensor.dispose();
         logits.dispose();
 
-        // Penalização de repetição
+        // --- Penalidade de repetição unigrama (token já visto na sequência) ---
         const seenSet = new Set(beam.ids);
+
+        // --- Penalidade de repetição de n-gramas (anti-gagueijo bigram/trigram) ---
+        // Um token candidato 'i' fecha um bigrama se beam.ids[-1]+i já ocorreu.
+        // Fecha um trigrama se beam.ids[-2]+beam.ids[-1]+i já ocorreu.
+        const bigramSet  = _buildNgramSet(beam.ids, 2);
+        const trigramSet = _buildNgramSet(beam.ids, 3);
+        const lastId     = beam.ids.length > 0 ? beam.ids[beam.ids.length - 1] : -1;
+        const prevId     = beam.ids.length > 1 ? beam.ids[beam.ids.length - 2] : -1;
+
         const probs = Array.from(logitsData).map((l, i) => {
-          let adj = l;
-          if (seenSet.has(i)) adj = adj > 0 ? adj / this.hparams.repetitionPenalty : adj * this.hparams.repetitionPenalty;
+          let adj = Math.max(l, 1e-10);
+
+          // Penalidade unigrama
+          if (seenSet.has(i)) {
+            adj = adj > 0
+              ? adj / this.hparams.repetitionPenalty
+              : adj * this.hparams.repetitionPenalty;
+          }
+
+          // Penalidade bigrama: se (lastId, i) já apareceu → penalidade extra 1.5x
+          if (lastId >= 0 && bigramSet.has(`${lastId},${i}`)) {
+            adj = adj / 1.5;
+          }
+
+          // Penalidade trigrama: se (prevId, lastId, i) já apareceu → bloqueia (prob ~0)
+          if (prevId >= 0 && lastId >= 0 && trigramSet.has(`${prevId},${lastId},${i}`)) {
+            adj = adj / 100;
+          }
+
           return { id: i, logprob: Math.log(Math.max(1e-10, adj / temperature)) };
         });
 
         probs.sort((a, b) => b.logprob - a.logprob);
 
         for (let k = 0; k < this.hparams.beamSize && k < probs.length; k++) {
-          const nextId = probs[k].id;
+          const nextId   = probs[k].id;
+          const finished = (nextId === SPECIAL.EOS);
           nextBeams.push({
-            ids:     [...beam.ids, nextId],
-            logProb: beam.logProb + probs[k].logprob,
+            ids:      [...beam.ids, nextId],
+            logProb:  beam.logProb + probs[k].logprob,
+            finished,
           });
-          if (nextId === SPECIAL.EOS) break;
+          // EOS encontrado — este beam está completo; não expandir mais este ramo.
+          if (finished) break;
         }
       }
 
