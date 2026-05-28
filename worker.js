@@ -60,7 +60,7 @@ const CONFIG = {
   httpPort:   parseInt(process.env.PORT || '3000', 10),
   saveEveryN: 5,
   generationLimits: {
-    social:  { maxTokens: 80,  temperature: 0.7 },
+    social:  { maxTokens: 40,  temperature: 0.5 }, // [FIX-QUALITY] menos tokens, temperatura menor → menos lixo
     analyze: { maxTokens: 200, temperature: 0.5 },
     code:    { maxTokens: 600, temperature: 0.3 },
     refino:  { maxTokens: 120, temperature: 0.4 },
@@ -126,6 +126,36 @@ const state = {
 
 let _trainLock = false;
 let _saveLock  = false;
+
+// ---------------------------------------------------------------------------
+// [FIX-QUALITY] Limpeza de saída neural
+// Remove artefatos comuns de um modelo em fase inicial de treino:
+//   <UNK>, prefixos "u:" / "a:", tokens repetidos em loop, pontuação solta
+// Retorna null se o resultado limpo for incoerente (< 3 palavras reais)
+// ---------------------------------------------------------------------------
+
+function cleanGeneratedText(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+
+  let text = raw
+    .replace(/<UNK>/gi, '')           // tokens desconhecidos
+    .replace(/\bu\s*:\s*/gi, '')       // prefixo "u:" que vaza do prompt
+    .replace(/\ba\s*:\s*/gi, '')       // prefixo "a:" que vaza do prompt
+    .replace(/\s([?.!,;:])/g, '$1')    // espaço antes de pontuação
+    .replace(/([?.!])\s*\1+/g, '$1')   // pontuação duplicada
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Remover repetição de tokens: "contexto contexto contexto" → "contexto"
+  text = text.replace(/\b(\w+)(\s+\1){2,}/gi, '$1');
+
+  // Remover se sobraram só pontuações ou tokens muito curtos
+  const words = text.split(/\s+/).filter(w => w.length > 1 && /[a-záéíóúãõâêô]/i.test(w));
+  if (words.length < 2) return null;
+
+  // Capitalizar primeira letra
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
 
 async function safeSave() {
   if (_saveLock) {
@@ -221,15 +251,14 @@ function startHttpServer() {
 
           console.log(`[GENERATE] Modo: ${behavior.mode} | Confidence: ${(behavior.confidence || 0).toFixed(2)} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
-          // [FIX-NEURAL-PRACTICE] Modo social sempre treina respondendo via neural.
-          // behavior_direct só é usado para modos não-sociais com alta confiança,
-          // ou como fallback final caso a rede retorne vazio.
+          // [FIX-NEURAL-PRACTICE] social sempre vai para neural — behavior_direct só para outros modos
           const useDirectOutput = behavior.output &&
             behavior.mode !== 'social' &&
             (behavior.confidence || 0) >= CONFIG.behaviorDirectConfidenceThreshold;
 
           if (useDirectOutput) {
             state.generationStats.direct++;
+            console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA: ${behavior.output} [direct]`);
             res.writeHead(200, headers);
             res.end(JSON.stringify({
               ok:         true,
@@ -246,39 +275,41 @@ function startHttpServer() {
           const genMaxTokens = max_tokens  || modeLimits.maxTokens;
           const genTemp      = temperature || modeLimits.temperature;
 
-          const generated = await state.model.generate(prompt, genMaxTokens, genTemp);
+          const rawGenerated = await state.model.generate(prompt, genMaxTokens, genTemp);
 
-          if (!generated || generated.length === 0) {
-            if (behavior.output) {
-              state.generationStats.direct++;
-              res.writeHead(200, headers);
-              res.end(JSON.stringify({
-                ok:         true,
-                prompt:     prompt,
-                generated:  behavior.output,
-                mode:       behavior.mode,
-                confidence: behavior.confidence,
-                source:     'behavior_fallback',
-              }));
-              return;
-            }
-            res.writeHead(503, headers);
-            res.end(JSON.stringify({ error: 'Geração falhou — modelo em aquecimento.' }));
+          // [FIX-QUALITY] Limpar saída neural: remover <UNK>, artefatos de formato, repetições
+          const cleanGenerated = cleanGeneratedText(rawGenerated);
+
+          // [FIX-ALWAYS-RESPOND] Nunca retornar 503 — fallback garante resposta sempre
+          if (!cleanGenerated) {
+            const fallbackText = behavior.output || 'Ainda estou aprendendo. Pode reformular?';
+            state.generationStats.direct = (state.generationStats.direct || 0) + 1;
+            console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA: ${fallbackText} [fallback-vazio]`);
+            res.writeHead(200, headers);
+            res.end(JSON.stringify({
+              ok:         true,
+              prompt:     prompt,
+              generated:  fallbackText,
+              mode:       behavior.mode,
+              confidence: behavior.confidence,
+              source:     'behavior_fallback',
+            }));
             return;
           }
 
           state.generationStats.neural = (state.generationStats.neural || 0) + 1;
           state.generationStats[behavior.mode] = (state.generationStats[behavior.mode] || 0) + 1;
 
+          console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA: ${cleanGenerated} [neural]`);
           res.writeHead(200, headers);
           res.end(JSON.stringify({
             ok:         true,
             prompt:     prompt,
-            generated:  generated,
+            generated:  cleanGenerated,
             mode:       behavior.mode,
             confidence: behavior.confidence,
             source:     'neural',
-            tokens:     generated.split(/\s+/).length,
+            tokens:     cleanGenerated.split(/\s+/).length,
           }));
         } catch (err) {
           console.error('[GENERATE] Erro:', err.message);
@@ -330,7 +361,7 @@ async function init() {
     state.model.ready = true;
   }
 
-  // [FIX-TIMEOUT] Marcar como carregado para evitar reload desnecessário durante treino
+  // [FIX-TIMEOUT] Evita double-build: marca como carregado logo após init
   state.modelLoadedFromBinary = true;
 
   console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'}`);
