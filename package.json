@@ -1,11 +1,12 @@
 {
   "name": "akie-worker",
-  "version": "1.0.0",
-  "description": "AKIE Training Worker — motor de aprendizado contínuo 24h",
+  "version": "2.0.0",
+  "description": "AKIE Training Worker v2.0 — Upgrade Moderado (embDim 128, hiddenSize 256, maxSeqLen 64)",
   "main": "worker.js",
   "scripts": {
     "start": "node worker.js",
-    "dev": "node --watch worker.js"
+    "dev": "node --watch worker.js",
+    "test": "echo \"No tests yet\""
   },
   "engines": {
     "node": ">=18.0.0"
@@ -15,5 +16,14 @@
     "firebase-admin": "^12.0.0",
     "dotenv": "^16.4.0"
   },
-  "license": "UNLICENSED"
+  "devDependencies": {},
+  "license": "UNLICENSED",
+  "keywords": [
+    "akie",
+    "aether",
+    "neural",
+    "language-model",
+    "pt-br"
+  ],
+  "author": "AETHER Team"
 }
