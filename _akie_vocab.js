@@ -1,8 +1,12 @@
 /**
- * _akie_vocab.js
+ * _akie_vocab.js v2.0
  * Gerenciamento incremental de vocabulário para o AKIE.
  * 
- * Tokens especiais reservados:
+ * UPGRADE:
+ *   makeTrainingPairs: maxLen 32 → 64 (contexto duplicado)
+ *   Tokens especiais reservados 0-3
+ *
+ * Tokens especiais:
  *   0 → <PAD>   padding
  *   1 → <UNK>   palavra desconhecida
  *   2 → <BOS>   início de sequência
@@ -28,7 +32,7 @@ class Vocabulary {
       this._add(tk);
     }
 
-    this.frozen = false; // quando frozen, não adiciona novos tokens
+    this.frozen = false;
   }
 
   _add(token) {
@@ -145,6 +149,9 @@ function tokenizeText(text) {
 /**
  * Gera pares (input_seq, target_token) para treino de language model.
  * 
+ * UPGRADE v2.0: maxLen padrão agora é 64 (era 32)
+ * Contexto duplicado para maior capacidade de modelagem de dependências longas.
+ * 
  * Dado "BOS ola e saudacao EOS":
  *   [BOS] → ola
  *   [BOS, ola] → e
@@ -152,10 +159,10 @@ function tokenizeText(text) {
  *   [BOS, ola, e, saudacao] → EOS
  * 
  * @param {number[]} ids      - Sequência tokenizada
- * @param {number}   maxLen   - Comprimento máximo de contexto
+ * @param {number}   maxLen   - Comprimento máximo de contexto (default 64)
  * @returns {Array<{x: number[], y: number}>}
  */
-function makeTrainingPairs(ids, maxLen = 32) {
+function makeTrainingPairs(ids, maxLen = 64) {  // ← ALTERADO: 32 → 64
   const pairs = [];
 
   for (let i = 1; i < ids.length; i++) {
