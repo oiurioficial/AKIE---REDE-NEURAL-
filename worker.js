@@ -226,6 +226,7 @@ function startHttpServer() {
 
           if (useDirectOutput) {
             state.generationStats.direct++;
+            console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA Respondeu: ${behavior.output}`);
             res.writeHead(200, headers);
             res.end(JSON.stringify({
               ok:         true,
@@ -247,6 +248,7 @@ function startHttpServer() {
           if (!generated || generated.length === 0) {
             if (behavior.output) {
               state.generationStats.direct++;
+              console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA Respondeu: ${behavior.output}`);
               res.writeHead(200, headers);
               res.end(JSON.stringify({
                 ok:         true,
@@ -265,6 +267,8 @@ function startHttpServer() {
 
           state.generationStats.neural = (state.generationStats.neural || 0) + 1;
           state.generationStats[behavior.mode] = (state.generationStats[behavior.mode] || 0) + 1;
+
+          console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA Respondeu: ${generated}`);
 
           res.writeHead(200, headers);
           res.end(JSON.stringify({
