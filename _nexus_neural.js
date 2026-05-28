@@ -206,7 +206,8 @@ class TokenEmbedding extends tf.layers.Layer {
     return tf.tidy(() => {
       const input = inputs[0] || inputs;
       const [batch, seqLen] = input.shape;
-      const flatInput = input.reshape([-1]);
+      // Cast explícito para int32 — tf.gather no tfjs-node 4.x rejeita outros dtypes
+      const flatInput = input.reshape([-1]).cast('int32');
       const embedded = tf.gather(this.embeddings.read(), flatInput);
       return embedded.reshape([batch, seqLen, this.outputDim]);
     });
@@ -377,7 +378,8 @@ class AKIEModel {
 
         const seqLen = batch[0].x.length;
         const xs = tf.tensor2d(batch.map(p => p.x), [batch.length, seqLen], 'int32');
-        const ys = tf.tensor1d(batch.map(p => p.y), 'int32');
+        // sparseCategoricalCrossentropy no tfjs-node 4.x exige float32 nos labels
+        const ys = tf.tensor1d(batch.map(p => p.y), 'float32');
 
         let result;
         try {
@@ -555,6 +557,23 @@ class AKIEModel {
         ) {
           console.warn(`[AKIE] ⚠️  Incompatibilidade: salvo=[emb=${savedEmbDim}|hid=${savedHidden}|seq=${savedMaxSeqLen}] vs atual=[emb=${this.hparams.embDim}|hid=${this.hparams.hiddenSize}|seq=${this.hparams.maxSeqLen}]`);
           console.warn('[AKIE] → Reinicializando com nova arquitetura...');
+          this.build();
+          return false;
+        }
+
+        // Validação por contagem de pesos — detecta mudança de arquitetura
+        // mesmo quando hparams são idênticos (ex: remoção/adição de camadas)
+        const savedWeightCount = manifest.length;
+        const shellForCount = new AKIEModel({ ...this.vocab, size: meta.embeddingVocabSize || this.vocab.size }, this.hparams);
+        shellForCount.embeddingVocabSize = meta.embeddingVocabSize || this.vocab.size;
+        shellForCount.build();
+        const expectedWeightCount = shellForCount.model.getWeights().length;
+        shellForCount.model.dispose?.();
+
+        if (savedWeightCount !== expectedWeightCount) {
+          console.warn(`[AKIE] ⚠️  Número de pesos incompatível: salvo=${savedWeightCount}, esperado=${expectedWeightCount}`);
+          console.warn('[AKIE] → Descartando modelo antigo e inicializando novo...');
+          await fs.promises.rm(tryDir, { recursive: true, force: true }).catch(() => {});
           this.build();
           return false;
         }
