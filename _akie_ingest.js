@@ -1,20 +1,18 @@
 /**
- * _akie_ingest.js  —  AKIE Data Engine (Ingestão Autônoma)
+ * _akie_ingest.js  —  AKIE Data Engine (Ingestão Autônoma) v3.0
  *
- * Pipeline permanente de aquisição de linguagem real em escala.
- * Roda integrado ao scheduler do worker.js como modo DATA_INGESTION.
+ * MUDANÇAS v3.0:
+ *   - Wikipedia REMOVIDA permanentemente (poluía grafo com texto enciclopédico formal)
+ *   - Foco 100% em Tatoeba PT/EN + banco de frases conversacionais nativas
+ *   - isValidSentence afrouxada: mínimo 5 chars, aceita gírias/contrações de chat
+ *   - Verbos expandidos com contrações coloquiais (tô, tá, vou, blz, vlw, tem...)
  *
- * Fontes:
- *   1. Simple Wikipedia (XML dump, ~230MB comprimido)
- *   2. Tatoeba sentences.csv (frases simples PT/EN)
- *
- * Fluxo por ciclo:
+ * Pipeline:
  *   carregarFila → extrairFrases → filtrar → tokenizar → treinarPares
  *
  * RESTRIÇÕES:
  *   - Zero texto bruto armazenado após processamento
  *   - Zero dependências externas (apenas Node.js nativo)
- *   - Zero alterações em _aether.js ou NEXUS
  */
 
 'use strict';
@@ -23,7 +21,6 @@ const https  = require('https');
 const http   = require('http');
 const fs     = require('fs');
 const path   = require('path');
-const zlib   = require('zlib');
 const stream = require('stream');
 
 const { tokenizeText, makeTrainingPairs } = require('./_akie_vocab');
@@ -32,32 +29,172 @@ const { tokenizeText, makeTrainingPairs } = require('./_akie_vocab');
 // Configuração
 // ---------------------------------------------------------------------------
 
-const INGEST_DIR     = process.env.INGEST_DIR || '/data/datasets';
-const BATCH_SIZE     = parseInt(process.env.INGEST_BATCH || '1000', 10);
-const MIN_WORDS      = 3;
-const MAX_WORDS      = 20;
-const MAX_QUEUE_SIZE = 50_000; // frases em memória por vez
+const INGEST_DIR      = process.env.INGEST_DIR || '/data/datasets';
+const BATCH_SIZE      = parseInt(process.env.INGEST_BATCH || '1000', 10);
+const MIN_CHARS       = 5;   // Reduzido de 10 → aceita "oi!", "blz", etc.
+const MAX_WORDS       = 30;  // Levemente aumentado para frases naturais
+const MAX_QUEUE_SIZE  = 50_000;
 
-// Arquivos de controle (cursor de posição)
-const WIKI_CURSOR_FILE   = path.join(INGEST_DIR, 'wiki_cursor.json');
-const TATOEBA_CURSOR_FILE = path.join(INGEST_DIR, 'tatoeba_cursor.json');
-const INGEST_STATS_FILE  = path.join(INGEST_DIR, 'ingest_stats.json');
+// Arquivos de controle
+const TATOEBA_CURSOR_FILE  = path.join(INGEST_DIR, 'tatoeba_cursor.json');
+const CONV_CURSOR_FILE     = path.join(INGEST_DIR, 'conv_cursor.json');
+const INGEST_STATS_FILE    = path.join(INGEST_DIR, 'ingest_stats.json');
 
 // ---------------------------------------------------------------------------
-// Fontes
+// Banco de frases conversacionais nativas (PT-BR coloquial)
+// Usado como fonte primária quando Tatoeba não está disponível,
+// e também intercalado como reforço conversacional.
+// ---------------------------------------------------------------------------
+
+const CONVERSATIONAL_SEED = [
+  // Saudações e cumprimentos
+  'oi, tudo bem?',
+  'olá, como vai?',
+  'tudo certo por aí?',
+  'e aí, sumido?',
+  'boa tarde, como você está?',
+  'bom dia, dormiu bem?',
+  'boa noite, tá tudo bem?',
+  'oi oi, como foi o dia?',
+  'fala, como tá?',
+  'oi, tô aqui sim',
+  // Respostas de saudação
+  'tô bem, obrigado',
+  'tudo ótimo, e você?',
+  'tá ótimo por aqui',
+  'tô indo, valeu por perguntar',
+  'tá tranquilo, e aí?',
+  'tô bem sim, e você?',
+  'tudo certo, e contigo?',
+  'aqui tá bem, obrigado',
+  'blz, e você?',
+  'vlw, tô bem',
+  // Expressões de concordância e discordância
+  'com certeza, faz sentido',
+  'não concordo muito com isso',
+  'acho que você tem razão',
+  'hmm, não sei não',
+  'pode ser, mas depende',
+  'exatamente isso que eu pensei',
+  'verdade, faz todo sentido',
+  'não sei se é bem assim',
+  'faz sentido pra mim',
+  'talvez, depende do caso',
+  // Perguntas cotidianas
+  'o que você acha disso?',
+  'como assim você não sabe?',
+  'qual é a sua opinião?',
+  'você conseguiu resolver?',
+  'precisa de ajuda com alguma coisa?',
+  'o que você quer fazer hoje?',
+  'tem alguma dúvida?',
+  'como posso te ajudar?',
+  'o que aconteceu?',
+  'pode me explicar melhor?',
+  // Respostas a perguntas
+  'não sei ao certo',
+  'deixa eu pensar um pouco',
+  'vou verificar isso pra você',
+  'sim, com certeza',
+  'não, não é bem assim',
+  'deixa eu te explicar melhor',
+  'posso te ajudar com isso',
+  'precisa de mais detalhes',
+  'vou te ajudar agora',
+  'claro, pode perguntar',
+  // Expressões de dúvida
+  'não entendi bem o que você quis dizer',
+  'pode repetir, por favor?',
+  'não ficou claro pra mim',
+  'você pode explicar de outro jeito?',
+  'o que exatamente você precisa?',
+  'não tenho certeza do que entendi',
+  'pode dar um exemplo?',
+  'não sei ao certo o que você quer',
+  // Conversas sobre o dia a dia
+  'hoje foi um dia bem corrido',
+  'tô com sono, fui dormir tarde',
+  'preciso tomar um café agora',
+  'tô com fome, vou comer algo',
+  'fui trabalhar de manhã cedo',
+  'tive reunião o dia todo',
+  'hoje choveu muito aqui',
+  'tô em casa hoje',
+  'saí mais cedo do trabalho',
+  'tô estudando essa semana',
+  // Expressões emocionais
+  'que ótima notícia',
+  'que chato isso',
+  'fiquei feliz quando soube',
+  'que situação difícil',
+  'tô animado com isso',
+  'me preocupei com essa situação',
+  'que alívio saber disso',
+  'tô surpreso com essa novidade',
+  'que tristeza isso',
+  'fiquei contente em ouvir',
+  // Pedidos e solicitações
+  'pode me ajudar com uma coisa?',
+  'preciso de uma dica rápida',
+  'você sabe como fazer isso?',
+  'tem como me explicar?',
+  'pode me dar um exemplo?',
+  'o que você recomenda?',
+  'qual é a melhor opção?',
+  'como você faria isso?',
+  'você pode verificar pra mim?',
+  'qual seria a melhor abordagem?',
+  // Despedidas
+  'até mais, foi bom conversar',
+  'tchau, cuida-se',
+  'até logo, valeu',
+  'flw, qualquer coisa me fala',
+  'até depois, boa sorte',
+  'abraço, até amanhã',
+  'boa noite, descanse bem',
+  'até mais, obrigado pela ajuda',
+  'tchau tchau',
+  'flw, foi bom conversar',
+  // Gírias e linguagem informal
+  'cara, que situação estranha',
+  'mano, não acredito nisso',
+  'véi, tô chocado',
+  'que demais, adorei a ideia',
+  'sério mesmo que aconteceu isso?',
+  'cara, que situação complicada',
+  'mano, como assim?',
+  'não tô acreditando nisso',
+  'que coisa louca',
+  'haha, que situação',
+  // Tecnologia e digital
+  'o aplicativo tá fora do ar',
+  'meu celular tá com problema',
+  'não tô conseguindo acessar o site',
+  'a internet tá lenta aqui',
+  'preciso atualizar o sistema',
+  'o arquivo não abre',
+  'tô tentando instalar mas não funciona',
+  'tem como recuperar os dados?',
+  'o computador travou de novo',
+  'preciso de ajuda com o código',
+  // Feedback e avaliação
+  'achei muito útil essa informação',
+  'isso me ajudou bastante',
+  'não foi bem o que eu esperava',
+  'superou minhas expectativas',
+  'gostei muito da resposta',
+  'ainda tenho dúvidas sobre isso',
+  'ficou mais claro agora',
+  'entendi perfeitamente',
+  'ainda não ficou claro pra mim',
+  'obrigado, isso resolveu meu problema',
+];
+
+// ---------------------------------------------------------------------------
+// Fontes (apenas Tatoeba + Conversacional Nativo)
 // ---------------------------------------------------------------------------
 
 const SOURCES = {
-  WIKIPEDIA: {
-    name:    'wikipedia',
-    url:     'https://dumps.wikimedia.org/simplewiki/latest/simplewiki-latest-pages-articles.xml.bz2',
-    file:    path.join(INGEST_DIR, 'simplewiki.xml.bz2'),
-    // Arquivo parseado (texto limpo, uma frase por linha)
-    parsed:  path.join(INGEST_DIR, 'simplewiki_sentences.txt'),
-    cursor:  WIKI_CURSOR_FILE,
-    lang:    'pt',
-    maxAge:  24 * 60 * 60 * 1000, // re-download após 24h
-  },
   TATOEBA: {
     name:   'tatoeba',
     url:    'https://downloads.tatoeba.org/exports/sentences.csv',
@@ -65,16 +202,25 @@ const SOURCES = {
     parsed: path.join(INGEST_DIR, 'tatoeba_sentences_pt.txt'),
     cursor: TATOEBA_CURSOR_FILE,
     lang:   'pt',
-    maxAge: 7 * 24 * 60 * 60 * 1000, // re-download após 7 dias
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  },
+  CONVERSATIONAL: {
+    name:   'conversational',
+    url:    null, // sem download externo — banco local
+    file:   null,
+    parsed: path.join(INGEST_DIR, 'conversational_pt.txt'),
+    cursor: CONV_CURSOR_FILE,
+    lang:   'pt',
+    maxAge: Infinity, // não expira
   },
 };
 
 // ---------------------------------------------------------------------------
-// Estado interno do módulo
+// Estado interno
 // ---------------------------------------------------------------------------
 
 const ingestState = {
-  initialized:  false,
+  initialized: false,
   stats: {
     total_extracted: 0,
     total_valid:     0,
@@ -118,11 +264,6 @@ function loadStats() {
   } catch (e) { /* ignora */ }
 }
 
-/**
- * Download com suporte a HTTP e HTTPS.
- * Sem axios. Sem dependências externas.
- * Retorna Promise<void> — salva em destPath.
- */
 function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith('https') ? https : http;
@@ -130,18 +271,15 @@ function downloadFile(url, destPath) {
 
     const doRequest = (targetUrl) => {
       proto.get(targetUrl, (res) => {
-        // Seguir redirect
         if (res.statusCode === 301 || res.statusCode === 302) {
           file.close();
           fs.unlinkSync(destPath + '.tmp');
           return doRequest(res.headers.location);
         }
-
         if (res.statusCode !== 200) {
           file.close();
           return reject(new Error(`HTTP ${res.statusCode} ao baixar ${targetUrl}`));
         }
-
         res.pipe(file);
         file.on('finish', () => {
           file.close(() => {
@@ -160,52 +298,62 @@ function downloadFile(url, destPath) {
   });
 }
 
-/**
- * Verifica se o arquivo precisa ser baixado novamente.
- */
 function needsDownload(filePath, maxAgeMs) {
+  if (!filePath) return false;
   if (!fs.existsSync(filePath)) return true;
   const stat = fs.statSync(filePath);
   return (Date.now() - stat.mtimeMs) > maxAgeMs;
 }
 
 // ---------------------------------------------------------------------------
-// FILTRO DE FRASES
+// FILTRO DE FRASES — v3.0 (afrouxado para chat coloquial PT-BR)
 // ---------------------------------------------------------------------------
 
-// Verbos e estruturas comuns em PT e EN para validação básica
-const VERB_PATTERNS_PT = /\b(é|são|foi|foram|ser|estar|tem|têm|ter|faz|fazer|pode|poder|deve|dever|vai|vão|ir|vem|vir|usa|usar|permite|fazer|gera|gerar|significa|representa|define|indica|mostra|inclui|contém|pertence|existe|ocorre|acontece|resulta|depende|precisa|ajuda|melhora|reduz|aumenta|permite|facilita|requer|possui|contém|apresenta|realiza|desenvolve|produz|cria|forma|compõe|afeta|influencia|explica|descreve)\b/i;
-const VERB_PATTERNS_EN = /\b(is|are|was|were|be|been|has|have|had|do|does|did|can|could|will|would|may|might|shall|should|must|need|use|uses|means|refers|defines|includes|contains|allows|requires|provides|enables|creates|forms|affects|helps|makes|gives|takes|shows|tells|says|becomes|remains|appears|seems|looks|feels|works|runs|goes|comes|gets|puts|sets|keeps|holds|turns|leads|brings|carries|starts|stops|ends|changes|grows|moves|happens|occurs|exists|results|depends|needs|represents|indicates|suggests|implies|demonstrates|explains|describes)\b/i;
+// Verbos e tokens conversacionais — inclui contrações e gírias
+const VERB_PATTERNS_PT = /\b(é|são|foi|foram|ser|estar|tem|têm|ter|faz|fazer|pode|poder|deve|dever|vai|vão|ir|vem|vir|usa|usar|tô|tá|tô|to|ta|vou|num|blz|vlw|né|hm|oi|olá|opa|ei|pra|pro|assim|sabe|acho|gosto|quer|quero|preciso|tenho|consigo|dá|dava|ficou|fiquei|fui|vim|sei|sabia|fica|tava|estava|eram|somos|somos|gera|significa|representa|define|indica|mostra|inclui|contém|existe|ocorre|acontece|resulta|depende|precisa|ajuda|melhora|reduz|aumenta|permite|facilita|requer|possui|apresenta|realiza|desenvolve|produz|cria|forma|afeta|explica|descreve)\b/i;
+const VERB_PATTERNS_EN = /\b(is|are|was|were|be|been|has|have|had|do|does|did|can|could|will|would|may|might|shall|should|must|need|use|uses|means|defines|includes|contains|allows|requires|provides|enables|creates|forms|helps|makes|gives|takes|shows|tells|becomes|remains|appears|seems|works|runs|goes|comes|gets|keeps|leads|brings|starts|stops|ends|changes|grows|moves|happens|occurs|exists|results|depends|represents|indicates|suggests|demonstrates|explains|describes)\b/i;
+
+// Tokens coloquiais que por si só validam a frase (dispensam verbo formal)
+const COLLOQUIAL_TOKENS = /\b(oi|olá|opa|ei|né|blz|vlw|flw|haha|rsrs|kkk|ok|oks|sim|não|nao|nope|yep|yeah|ops|nossa|uau|wow|poxa|puts|caramba|vish|ué|oxe|eita|pronto|claro|exato|certo|errado|legal|top|show|massa|dahora|maneiro|demais|irado)\b/i;
 
 /**
- * Verifica se uma frase é válida para ingestão.
- * Critérios: tamanho, conteúdo, presença de verbo.
+ * isValidSentence v3.0 — afrouxada para chat coloquial
  */
 function isValidSentence(sentence) {
   if (!sentence || typeof sentence !== 'string') return false;
 
   const trimmed = sentence.trim();
-  if (trimmed.length < 10) return false;
-  if (trimmed.length > 200) return false;
+
+  // Mínimo de 5 chars (aceita "oi!", "blz", etc.)
+  if (trimmed.length < MIN_CHARS) return false;
+  if (trimmed.length > 300) return false;
 
   // Remover frases com caracteres problemáticos
   if (/[<>{}[\]|\\^`~]/.test(trimmed)) return false;
   if (/https?:\/\//.test(trimmed)) return false;
-  if (/\d{4,}/.test(trimmed)) return false; // números longos (anos OK: 4 dígitos, mas evitar IDs)
 
-  // Contar palavras
+  // Aceitar tokens coloquiais diretamente (dispensam validação verbal)
+  if (COLLOQUIAL_TOKENS.test(trimmed)) return true;
+
+  // Verificar presença de letras (ratio mínimo de 50% — mais permissivo)
+  const alphaRatio = (trimmed.match(/[a-záéíóúãõâêôàçü]/gi) || []).length / trimmed.length;
+  if (alphaRatio < 0.5) return false;
+
+  // Pelo menos 2 tokens (palavras)
   const words = trimmed.split(/\s+/).filter(w => w.length > 0);
-  if (words.length < MIN_WORDS) return false;
+  if (words.length < 2) return false;
   if (words.length > MAX_WORDS) return false;
 
-  // Verificar se tem estrutura verbal (PT ou EN)
-  if (!VERB_PATTERNS_PT.test(trimmed) && !VERB_PATTERNS_EN.test(trimmed)) return false;
+  // Presença de verbo/marcador conversacional PT ou EN
+  if (VERB_PATTERNS_PT.test(trimmed) || VERB_PATTERNS_EN.test(trimmed)) return true;
 
-  // Rejeitar frases que são só números/símbolos
-  const alphaRatio = (trimmed.match(/[a-záéíóúãõâêôàç]/gi) || []).length / trimmed.length;
-  if (alphaRatio < 0.6) return false;
+  // Frases interrogativas (terminam em ?) também são válidas
+  if (trimmed.endsWith('?')) return true;
 
-  return true;
+  // Frases com pelo menos 4 palavras podem ser aceitas mesmo sem verbo detectado
+  if (words.length >= 4) return true;
+
+  return false;
 }
 
 /**
@@ -221,142 +369,12 @@ function normalizeSentence(sentence) {
 }
 
 // ---------------------------------------------------------------------------
-// WIKIPEDIA — Parser de XML/BZ2
-// ---------------------------------------------------------------------------
-
-/**
- * Converte o dump XML comprimido em arquivo de frases (1 por linha).
- * Usa streaming — nunca carrega o XML inteiro em memória.
- *
- * Processo:
- *   bz2 stream → descomprimir (bzip2 manual não disponível no Node nativo)
- *   Alternativa: usar apenas gzip se disponível, ou pré-processar offline.
- *
- * NOTA: Node.js não tem bzip2 nativo. Usamos o binário `bzip2` do sistema
- * (disponível no Railway/Ubuntu) via child_process.spawn.
- */
-async function parseWikipediaDump(source) {
-  const { file, parsed } = source;
-
-  if (!fs.existsSync(file)) {
-    console.log('[INGEST] Wikipedia: arquivo não encontrado, pulando parse.');
-    return 0;
-  }
-
-  console.log('[INGEST] Wikipedia: iniciando parse do dump XML...');
-
-  const { spawn } = require('child_process');
-  const parsedStream = fs.createWriteStream(parsed, { flags: 'w' });
-
-  return new Promise((resolve, reject) => {
-    // Descomprimir via bzip2 -d -c (stdout)
-    const bzip2 = spawn('bzip2', ['-d', '-c', file]);
-    let buffer     = '';
-    let inText     = false;
-    let extracted  = 0;
-    let lineCount  = 0;
-
-    bzip2.stdout.on('data', (chunk) => {
-      buffer += chunk.toString('utf8', 0, Math.min(chunk.length, 65536));
-
-      // Processar por blocos para controlar memória
-      let newline;
-      while ((newline = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, newline);
-        buffer = buffer.slice(newline + 1);
-
-        // Detectar início e fim de bloco de texto
-        if (line.includes('<text ') || line.trim().startsWith('<text>')) {
-          inText = true;
-        }
-        if (line.includes('</text>')) {
-          inText = false;
-        }
-
-        if (!inText) continue;
-
-        // Limpar markup wiki
-        const clean = cleanWikiMarkup(line);
-        if (!clean) continue;
-
-        // Dividir em frases
-        const sentences = splitSentences(clean);
-        for (const s of sentences) {
-          if (isValidSentence(s)) {
-            parsedStream.write(normalizeSentence(s) + '\n');
-            extracted++;
-            lineCount++;
-          }
-        }
-
-        // Limite de segurança: não parsear mais de 2M frases por vez
-        if (extracted > 2_000_000) {
-          bzip2.kill();
-          break;
-        }
-      }
-    });
-
-    bzip2.on('close', () => {
-      parsedStream.end(() => {
-        console.log(`[INGEST] Wikipedia: ${extracted} frases válidas extraídas → ${parsed}`);
-        resolve(extracted);
-      });
-    });
-
-    bzip2.stderr.on('data', (d) => {
-      // bzip2 escreve progresso no stderr — ignorar
-    });
-
-    bzip2.on('error', (err) => {
-      parsedStream.end();
-      // bzip2 não disponível — tentar fallback gzip
-      console.log('[INGEST] Wikipedia: bzip2 não disponível, pulando. Use arquivo .gz ou pré-processe offline.');
-      resolve(0);
-    });
-  });
-}
-
-/**
- * Remove markup wiki de uma linha de texto.
- * Remove: templates {{...}}, links [[...]], tags XML, cabeçalhos ==
- */
-function cleanWikiMarkup(line) {
-  let s = line;
-
-  // Remover tags XML
-  s = s.replace(/<[^>]+>/g, ' ');
-
-  // Remover templates {{ ... }}
-  s = s.replace(/\{\{[^}]*\}\}/g, ' ');
-
-  // Converter links [[Texto|Display]] → Display ou Texto
-  s = s.replace(/\[\[(?:[^\]|]*\|)?([^\]]*)\]\]/g, '$1');
-
-  // Remover links externos [http://... texto]
-  s = s.replace(/\[https?:\/\/[^\s\]]+\s*([^\]]*)\]/g, '$1');
-
-  // Remover cabeçalhos ==
-  s = s.replace(/={2,}[^=]+=*/g, '');
-
-  // Remover referências
-  s = s.replace(/&[a-z]+;/g, ' ');
-
-  // Limpar espaços
-  s = s.replace(/\s+/g, ' ').trim();
-
-  return s.length > 5 ? s : '';
-}
-
-// ---------------------------------------------------------------------------
 // TATOEBA — Parser CSV
 // ---------------------------------------------------------------------------
 
 /**
- * Parseia o sentences.csv do Tatoeba e extrai frases PT e EN.
- *
+ * Parseia sentences.csv e extrai frases PT e EN.
  * Formato: id\tlang\ttext
- * Ex: 1234\tpor\tO gato está na mesa.
  */
 async function parseTatoeba(source) {
   const { file, parsed } = source;
@@ -371,15 +389,13 @@ async function parseTatoeba(source) {
   const content = fs.readFileSync(file, 'utf8');
   const lines   = content.split('\n');
   const out     = fs.createWriteStream(parsed, { flags: 'w' });
-
-  let extracted = 0;
+  let   extracted = 0;
 
   for (const line of lines) {
     const parts = line.split('\t');
     if (parts.length < 3) continue;
 
     const lang = parts[1].trim().toLowerCase();
-    // Aceitar PT (por, pt) e EN (eng, en) 
     if (!['por', 'pt', 'eng', 'en'].includes(lang)) continue;
 
     const text = parts.slice(2).join('\t').trim();
@@ -388,58 +404,67 @@ async function parseTatoeba(source) {
       extracted++;
     }
 
-    if (extracted > 500_000) break; // limite de segurança
+    if (extracted > 500_000) break;
   }
 
   await new Promise(resolve => out.end(resolve));
-  console.log(`[INGEST] Tatoeba: ${extracted} frases válidas extraídas → ${parsed}`);
+  console.log(`[INGEST] Tatoeba: ${extracted} frases válidas → ${parsed}`);
   return extracted;
+}
+
+// ---------------------------------------------------------------------------
+// CONVERSACIONAL NATIVO — Gera/atualiza arquivo de frases locais
+// ---------------------------------------------------------------------------
+
+/**
+ * Escreve o banco de frases conversacionais nativas em disco.
+ * Chamado automaticamente se o arquivo não existir.
+ */
+async function ensureConversationalFile(source) {
+  if (fs.existsSync(source.parsed)) return true;
+
+  ensureDir(INGEST_DIR);
+  const out = fs.createWriteStream(source.parsed, { flags: 'w' });
+
+  for (const phrase of CONVERSATIONAL_SEED) {
+    out.write(normalizeSentence(phrase) + '\n');
+  }
+
+  await new Promise(resolve => out.end(resolve));
+  console.log(`[INGEST] Conversacional: ${CONVERSATIONAL_SEED.length} frases gravadas → ${source.parsed}`);
+  return true;
 }
 
 // ---------------------------------------------------------------------------
 // DIVISOR DE FRASES
 // ---------------------------------------------------------------------------
 
-/**
- * Divide um bloco de texto em frases individuais.
- * Estratégia conservadora: divide em .!? seguidos de espaço+maiúscula.
- */
 function splitSentences(text) {
   if (!text) return [];
-
   return text
-    // Ponto final / exclamação / interrogação seguido de espaço
     .split(/(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÃÕÂÊÔ\w])/)
     .map(s => s.trim())
-    .filter(s => s.length > 10);
+    .filter(s => s.length >= MIN_CHARS);
 }
 
 // ---------------------------------------------------------------------------
 // LEITOR DE ARQUIVO EM BLOCOS (cursor-based)
 // ---------------------------------------------------------------------------
 
-/**
- * Lê até `batchSize` linhas a partir do cursor atual.
- * Atualiza o cursor após a leitura.
- * Retorna array de strings (frases).
- *
- * Usa `byteOffset` para evitar carregar o arquivo inteiro em memória.
- */
 function readBatch(filePath, cursor, batchSize) {
   if (!fs.existsSync(filePath)) return [];
 
   const stats = fs.statSync(filePath);
 
-  // Cursor chegou ao fim do arquivo — resetar para recomeçar
   if (cursor.byteOffset >= stats.size) {
     cursor.byteOffset = 0;
     cursor.linesRead  = 0;
     cursor.done       = false;
-    console.log(`[INGEST] Cursor resetado para ${path.basename(filePath)} — reiniciando do início`);
+    console.log(`[INGEST] Cursor resetado para ${path.basename(filePath)} — reiniciando`);
   }
 
   const fd     = fs.openSync(filePath, 'r');
-  const BUF    = Buffer.allocUnsafe(Math.min(512 * 1024, stats.size)); // 512KB por leitura
+  const BUF    = Buffer.allocUnsafe(Math.min(512 * 1024, stats.size));
   let   offset = cursor.byteOffset;
   let   text   = '';
   const lines  = [];
@@ -463,9 +488,7 @@ function readBatch(filePath, cursor, batchSize) {
 
   fs.closeSync(fd);
 
-  // Atualizar cursor pela posição real dos bytes consumidos
-  // Recalcular baseado nas linhas consumidas (aproximação conservadora)
-  const consumed = lines.join('\n').length + lines.length; // +1 por \n em cada linha
+  const consumed = lines.join('\n').length + lines.length;
   cursor.byteOffset = Math.min(cursor.byteOffset + consumed, stats.size);
   cursor.linesRead += lines.length;
 
@@ -476,24 +499,17 @@ function readBatch(filePath, cursor, batchSize) {
 // CONVERSÃO FRASE → PARES DE TREINO
 // ---------------------------------------------------------------------------
 
-/**
- * Converte array de frases em pares de treino.
- * Expande vocabulário com tokens novos.
- * Retorna pares {x, y} para trainBatch.
- */
 function sentencesToTrainingPairs(sentences, vocab) {
   const allPairs = [];
 
   for (const sentence of sentences) {
     const tokens = tokenizeText(sentence);
-    if (tokens.length < MIN_WORDS) continue;
+    if (tokens.length < 2) continue;
 
-    // Adicionar tokens novos ao vocabulário
     vocab.addTokens(tokens);
 
-    // Tokenizar com IDs
     const ids = vocab.tokenize(sentence);
-    if (ids.length < 3) continue;
+    if (ids.length < 2) continue;
 
     const pairs = makeTrainingPairs(ids);
     allPairs.push(...pairs);
@@ -506,34 +522,24 @@ function sentencesToTrainingPairs(sentences, vocab) {
 // VERIFICAÇÃO E DOWNLOAD DE FONTES
 // ---------------------------------------------------------------------------
 
-/**
- * Garante que o arquivo da fonte existe e está atualizado.
- * Faz download apenas se necessário.
- * Retorna true se o arquivo está disponível.
- */
 async function ensureSourceFile(source) {
   ensureDir(INGEST_DIR);
 
+  // Fonte conversacional local — sem download
+  if (!source.url) return true;
+
   if (needsDownload(source.file, source.maxAge)) {
     console.log(`[INGEST] Baixando ${source.name}...`);
-    console.log(`[INGEST] URL: ${source.url}`);
-
     try {
       await downloadFile(source.url, source.file);
       const stat = fs.statSync(source.file);
       console.log(`[INGEST] ${source.name} baixado: ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
 
-      // Re-parsear após novo download
-      const parsedExists = fs.existsSync(source.parsed);
-      if (parsedExists) fs.unlinkSync(source.parsed);
-
-      // Resetar cursor
+      if (fs.existsSync(source.parsed)) fs.unlinkSync(source.parsed);
       saveCursor(source.cursor, { byteOffset: 0, linesRead: 0, done: false });
-
       return true;
     } catch (err) {
       console.log(`[INGEST] Falha no download de ${source.name}: ${err.message}`);
-      // Se arquivo anterior existe, continuar com ele
       return fs.existsSync(source.file) || fs.existsSync(source.parsed);
     }
   }
@@ -541,18 +547,14 @@ async function ensureSourceFile(source) {
   return true;
 }
 
-/**
- * Garante que o arquivo parseado existe.
- * Se não existe mas o raw existe, parsear.
- */
 async function ensureParsedFile(source) {
+  // Fonte conversacional local
+  if (!source.url) {
+    return await ensureConversationalFile(source);
+  }
+
   if (fs.existsSync(source.parsed)) return true;
   if (!fs.existsSync(source.file))  return false;
-
-  if (source.name === 'wikipedia') {
-    const count = await parseWikipediaDump(source);
-    return count > 0;
-  }
 
   if (source.name === 'tatoeba') {
     const count = await parseTatoeba(source);
@@ -567,9 +569,8 @@ async function ensureParsedFile(source) {
 // ---------------------------------------------------------------------------
 
 /**
- * Roda um ciclo de ingestão de dados.
- * Chamado pelo scheduler no modo DATA_INGESTION.
- *
+ * Roda um ciclo de ingestão.
+ * Alterna entre TATOEBA e CONVERSATIONAL em round-robin.
  * Retorna: { pairs: Array, vocabGrowth: number, sentences: number }
  */
 async function runDataIngestion(vocab, options) {
@@ -581,39 +582,36 @@ async function runDataIngestion(vocab, options) {
 
   if (!ingestState.initialized) {
     ingestState.initialized = true;
-    console.log('[INGEST] Data Engine iniciado.');
+    console.log('[INGEST] Data Engine v3.0 iniciado (Wikipedia removida).');
     console.log(`[INGEST] Dir: ${INGEST_DIR} | Batch: ${batchSize} frases/ciclo`);
   }
 
-  const allPairs     = [];
-  const vocabBefore  = vocab.size;
-  let   totalSents   = 0;
-  let   validSents   = 0;
+  const allPairs    = [];
+  const vocabBefore = vocab.size;
+  let   totalSents  = 0;
+  let   validSents  = 0;
 
-  // Selecionar fonte ativa (alterna entre fontes a cada ciclo)
+  // Round-robin entre as fontes ativas
   const sourceKeys = Object.keys(SOURCES);
   const cycleCount = ingestState.stats.total_inserted || 0;
-  const sourceKey  = sourceKeys[cycleCount % sourceKeys.length];  // round-robin
+  const sourceKey  = sourceKeys[cycleCount % sourceKeys.length];
   const source     = SOURCES[sourceKey];
 
   console.log(`[INGEST] Fonte ativa: ${source.name}`);
 
-  // 1. Garantir arquivo disponível (download se necessário)
   const available = await ensureSourceFile(source);
   if (!available) {
     console.log(`[INGEST] ${source.name}: não disponível, pulando ciclo.`);
     return { pairs: [], vocabGrowth: 0, sentences: 0 };
   }
 
-  // 2. Garantir arquivo parseado
   const parsed = await ensureParsedFile(source);
   if (!parsed) {
     console.log(`[INGEST] ${source.name}: parse ainda não disponível.`);
     return { pairs: [], vocabGrowth: 0, sentences: 0 };
   }
 
-  // 3. Ler batch do cursor atual
-  const cursor   = readCursor(source.cursor);
+  const cursor    = readCursor(source.cursor);
   const sentences = readBatch(source.parsed, cursor, batchSize);
   saveCursor(source.cursor, cursor);
 
@@ -625,38 +623,39 @@ async function runDataIngestion(vocab, options) {
     return { pairs: [], vocabGrowth: 0, sentences: 0 };
   }
 
-  // 4. Filtrar (isValidSentence já foi aplicado no parse, mas aplicar novamente
-  //    para garantir qualidade após normalização)
+  // Filtrar novamente após normalização
   const filtered = sentences.filter(isValidSentence);
   validSents = filtered.length;
   console.log(`[INGEST] frases válidas: ${validSents}`);
 
-  // 5. Converter em pares de treino + expandir vocabulário
   const pairs = sentencesToTrainingPairs(filtered, vocab);
   allPairs.push(...pairs);
 
   const vocabGrowth = vocab.size - vocabBefore;
 
-  // 6. Atualizar stats
   ingestState.stats.total_extracted += totalSents;
   ingestState.stats.total_valid     += validSents;
   ingestState.stats.total_inserted  += pairs.length;
   ingestState.stats.last_run        = new Date().toISOString();
-  ingestState.stats.sources[source.name] = ingestState.stats.sources[source.name] || {};
-  ingestState.stats.sources[source.name].last_batch = validSents;
-  ingestState.stats.sources[source.name].total_pairs = (ingestState.stats.sources[source.name].total_pairs || 0) + pairs.length;
+
+  if (!ingestState.stats.sources[source.name]) {
+    ingestState.stats.sources[source.name] = {};
+  }
+  ingestState.stats.sources[source.name].last_batch  = validSents;
+  ingestState.stats.sources[source.name].total_pairs =
+    (ingestState.stats.sources[source.name].total_pairs || 0) + pairs.length;
 
   saveStats();
 
-  console.log(`[INGEST] frases inseridas: ${validSents} → ${pairs.length} pares`);
+  console.log(`[INGEST] ${source.name}: ${validSents} frases → ${pairs.length} pares`);
   if (vocabGrowth > 0) {
     console.log(`[INGEST] vocabulário: +${vocabGrowth} tokens (total: ${vocab.size})`);
   }
 
   return {
-    pairs:        allPairs,
-    vocabGrowth:  vocabGrowth,
-    sentences:    validSents,
+    pairs:       allPairs,
+    vocabGrowth: vocabGrowth,
+    sentences:   validSents,
   };
 }
 
@@ -664,19 +663,14 @@ async function runDataIngestion(vocab, options) {
 // STATUS
 // ---------------------------------------------------------------------------
 
-/**
- * Retorna status atual do data engine.
- * Usado pelo endpoint GET /status do worker.
- */
 function getIngestStatus() {
   loadStats();
   const status = { ...ingestState.stats };
 
-  // Adicionar info sobre arquivos locais
   status.files = {};
   for (const [key, src] of Object.entries(SOURCES)) {
-    const rawExists    = fs.existsSync(src.file);
-    const parsedExists = fs.existsSync(src.parsed);
+    const parsedExists = src.parsed ? fs.existsSync(src.parsed) : false;
+    const rawExists    = src.file   ? fs.existsSync(src.file)   : false;
     const cursor       = readCursor(src.cursor);
 
     status.files[src.name] = {
@@ -701,7 +695,6 @@ module.exports = {
   isValidSentence,
   normalizeSentence,
   splitSentences,
-  cleanWikiMarkup,
   INGEST_DIR,
   SOURCES,
 };
