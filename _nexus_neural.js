@@ -140,6 +140,52 @@ class AddPositionalEmbedding extends tf.layers.Layer {
 }
 tf.serialization.registerClass(AddPositionalEmbedding);
 
+// ---------------------------------------------------------------------------
+// Embedding Customizado (compatível com tfjs 4.11.0+)
+// ---------------------------------------------------------------------------
+
+class TokenEmbedding extends tf.layers.Layer {
+  constructor(config) {
+    super(config || {});
+    this.inputDim = config.inputDim;   // vocab size
+    this.outputDim = config.outputDim; // embedding dimension
+    this.inputLength = config.inputLength;
+  }
+
+  build(inputShape) {
+    this.embeddings = this.addWeight(
+      'embeddings',
+      [this.inputDim, this.outputDim],
+      'float32',
+      tf.initializers.glorotUniform()
+    );
+    this.built = true;
+  }
+
+  computeOutputShape(inputShape) {
+    return [inputShape[0], this.inputLength, this.outputDim];
+  }
+
+  call(inputs) {
+    return tf.tidy(() => {
+      const input = inputs[0] || inputs;
+      const [batch, seqLen] = input.shape;
+      const flatInput = input.reshape([-1]);
+      
+      // Gather: buscar embeddings para cada token
+      const embedded = tf.gather(this.embeddings.read(), flatInput);
+      
+      // Reshape para [batch, seqLen, outputDim]
+      return embedded.reshape([batch, seqLen, this.outputDim]);
+    });
+  }
+
+  static get className() { return 'TokenEmbedding'; }
+}
+tf.serialization.registerClass(TokenEmbedding);
+
+// ---------------------------------------------------------------------------
+
 class ExtractLastToken extends tf.layers.Layer {
   constructor(config) { super(config || {}); }
   computeOutputShape(inputShape) { return [inputShape[0], inputShape[2]]; }
@@ -194,7 +240,9 @@ class AKIEModel {
     const headDim = Math.floor(embDim / numHeads);
 
     const input = tf.input({ shape: [maxSeqLen], dtype: 'int32', name: 'context' });
-    const embedding = tf.layers.embedding({
+    
+    // Use TokenEmbedding customizado (compatível com tfjs 4.11.0+)
+    const embedding = new TokenEmbedding({
       inputDim: vocabSize,
       outputDim: embDim,
       inputLength: maxSeqLen,
