@@ -33,6 +33,7 @@ const fs     = require('fs');
 const { AKIEModel }              = require('./_nexus_neural');
 const { Vocabulary, tokenizeText } = require('./_akie_vocab');
 const { runBootstrap }             = require('./_akie_bootstrap');
+const { runConversationalSeed }    = require('./_seed_conversacional');
 const {
   fetchUserEpisodes,
   episodesToPairs,
@@ -434,6 +435,9 @@ async function init() {
   // Bootstrap — garante que o sistema nunca inicie com grafo vazio
   // Idempotente: só roda uma vez na vida do Firestore
   const bootstrapped = await runBootstrap(state.db, state.vocab);
+
+  // Seed conversacional — injeta nós básicos PT-BR uma única vez
+  await runConversationalSeed(state.db);
 
   if (bootstrapped) {
     await saveVocab(state.vocab);
