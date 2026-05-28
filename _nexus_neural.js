@@ -247,7 +247,7 @@ class AKIEModel {
       outputDim: embDim,
       inputLength: maxSeqLen,
       name: 'token_embedding'
-    })(input);
+    }).apply(input);
 
     const posEmbedded = new AddPositionalEmbedding({
       maxSeqLen,
