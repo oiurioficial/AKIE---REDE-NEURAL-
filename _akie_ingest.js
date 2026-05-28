@@ -197,12 +197,12 @@ const CONVERSATIONAL_SEED = [
 const SOURCES = {
   TATOEBA: {
     name:   'tatoeba',
-    url:    'https://downloads.tatoeba.org/exports/sentences.csv',
-    file:   path.join(INGEST_DIR, 'tatoeba_sentences.csv'),
+    url:    null, // Download desativado — arquivo grande demais para contêiner 512MB
+    file:   null,
     parsed: path.join(INGEST_DIR, 'tatoeba_sentences_pt.txt'),
     cursor: TATOEBA_CURSOR_FILE,
     lang:   'pt',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    maxAge: Infinity,
   },
   CONVERSATIONAL: {
     name:   'conversational',
@@ -525,7 +525,7 @@ function sentencesToTrainingPairs(sentences, vocab) {
 async function ensureSourceFile(source) {
   ensureDir(INGEST_DIR);
 
-  // Fonte conversacional local — sem download
+  // Fonte sem URL (conversacional local ou tatoeba sem download) — sem download
   if (!source.url) return true;
 
   if (needsDownload(source.file, source.maxAge)) {
@@ -603,6 +603,26 @@ async function runDataIngestion(vocab, options) {
   if (!available) {
     console.log(`[INGEST] ${source.name}: não disponível, pulando ciclo.`);
     return { pairs: [], vocabGrowth: 0, sentences: 0 };
+  }
+
+  // Se o arquivo parsed do Tatoeba não existir, redireciona para CONVERSATIONAL
+  if (source.name === 'tatoeba' && !fs.existsSync(source.parsed)) {
+    console.log('[INGEST] Tatoeba parsed não encontrado — usando CONVERSATIONAL como fallback.');
+    const convSource = SOURCES.CONVERSATIONAL;
+    await ensureConversationalFile(convSource);
+    const convCursor    = readCursor(convSource.cursor);
+    const convSentences = readBatch(convSource.parsed, convCursor, batchSize);
+    saveCursor(convSource.cursor, convCursor);
+    const filtered = convSentences.filter(isValidSentence);
+    const pairs    = sentencesToTrainingPairs(filtered, vocab);
+    const vocabGrowth = vocab.size - vocabBefore;
+    ingestState.stats.total_extracted += convSentences.length;
+    ingestState.stats.total_valid     += filtered.length;
+    ingestState.stats.total_inserted  += pairs.length;
+    ingestState.stats.last_run        = new Date().toISOString();
+    saveStats();
+    console.log(`[INGEST] conversational (fallback): ${filtered.length} frases → ${pairs.length} pares`);
+    return { pairs, vocabGrowth, sentences: filtered.length };
   }
 
   const parsed = await ensureParsedFile(source);
