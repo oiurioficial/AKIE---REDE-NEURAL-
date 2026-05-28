@@ -221,12 +221,15 @@ function startHttpServer() {
 
           console.log(`[GENERATE] Modo: ${behavior.mode} | Confidence: ${(behavior.confidence || 0).toFixed(2)} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
+          // [FIX-NEURAL-PRACTICE] Modo social sempre treina respondendo via neural.
+          // behavior_direct só é usado para modos não-sociais com alta confiança,
+          // ou como fallback final caso a rede retorne vazio.
           const useDirectOutput = behavior.output &&
+            behavior.mode !== 'social' &&
             (behavior.confidence || 0) >= CONFIG.behaviorDirectConfidenceThreshold;
 
           if (useDirectOutput) {
             state.generationStats.direct++;
-            console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA Respondeu: ${behavior.output}`);
             res.writeHead(200, headers);
             res.end(JSON.stringify({
               ok:         true,
@@ -248,7 +251,6 @@ function startHttpServer() {
           if (!generated || generated.length === 0) {
             if (behavior.output) {
               state.generationStats.direct++;
-              console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA Respondeu: ${behavior.output}`);
               res.writeHead(200, headers);
               res.end(JSON.stringify({
                 ok:         true,
@@ -267,8 +269,6 @@ function startHttpServer() {
 
           state.generationStats.neural = (state.generationStats.neural || 0) + 1;
           state.generationStats[behavior.mode] = (state.generationStats[behavior.mode] || 0) + 1;
-
-          console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA Respondeu: ${generated}`);
 
           res.writeHead(200, headers);
           res.end(JSON.stringify({
@@ -329,6 +329,9 @@ async function init() {
     state.model.build();
     state.model.ready = true;
   }
+
+  // [FIX-TIMEOUT] Marcar como carregado para evitar reload desnecessário durante treino
+  state.modelLoadedFromBinary = true;
 
   console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'}`);
 
