@@ -279,10 +279,6 @@ function startHttpServer() {
     console.log(`[HTTP] Servidor listening na porta ${CONFIG.httpPort}`);
   });
 
-  // Timeout de 120s: evita que treinos pesados travem conexões pendentes
-  server.timeout = 120_000;
-  server.keepAliveTimeout = 65_000;
-
   server.on('error', err => {
     console.error('[HTTP] Erro no servidor:', err.message);
   });
@@ -515,9 +511,7 @@ async function runMode(mode, ctx = {}) {
     }
 
     case MODE.CONSOLIDATION: {
-      // Cap reduzido: 80 frases/ciclo (era 300) — evita timeout de CPU no Railway.
-      // O grafo cresce incrementalmente; 80 frases processam em <15s na CPU contêiner.
-      const sentences = await fetchGraphSentences(state.db, 80);
+      const sentences = await fetchGraphSentences(state.db, 300);
       if (!sentences.length) {
         console.log(`${tag} Grafo vazio — pulando consolidação`);
         return;
@@ -530,12 +524,26 @@ async function runMode(mode, ctx = {}) {
     case MODE.EXPANSION: {
       const vocabBefore = state.vocab.size;
 
-      const ingestResult = await runDataIngestion(state.vocab, {
-        batchSize: 500,
-      });
-
+      // 1. Ingestão local (Tatoeba/conversacional)
+      const ingestResult = await runDataIngestion(state.vocab, { batchSize: 500 });
       pairs = ingestResult.pairs;
-      desc  = `ingest (${ingestResult.sentences} frases) → ${pairs.length} pares`;
+
+      // 2. Web via Serper/Tavily — só roda se a key estiver configurada.
+      // fetchWebPatterns busca 3 queries por ciclo, extrai sentenças,
+      // expande o nexus_graph e retorna pares de teacher-forcing.
+      if (process.env.SERPER_API_KEY || process.env.TAVILY_API_KEY) {
+        try {
+          const webPairs = await fetchWebPatterns(state.db, state.vocab, 3);
+          if (webPairs.length > 0) {
+            pairs = [...pairs, ...webPairs];
+            console.log(`[EXPANSION] Serper adicionou ${webPairs.length} pares ao ciclo`);
+          }
+        } catch (webErr) {
+          console.error('[EXPANSION] fetchWebPatterns falhou (não fatal):', webErr.message);
+        }
+      }
+
+      desc = `ingest (${ingestResult.sentences} frases) + web → ${pairs.length} pares`;
 
       if (state.vocab.size > vocabBefore) {
         await saveVocab(state.vocab);
