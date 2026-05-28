@@ -105,6 +105,35 @@ const state = {
 };
 
 // ---------------------------------------------------------------------------
+// Mutexes de exclusão mútua
+// ---------------------------------------------------------------------------
+
+// Impede que dois ciclos executem model.fit() ao mesmo tempo
+// (ex: CONSOLIDATION ~75s iniciada quando o scheduler de 60s dispara novamente)
+let _trainLock = false;
+
+// Impede save concorrente entre ciclo periódico e SIGTERM
+let _saveLock = false;
+
+async function safeSave() {
+  if (_saveLock) {
+    console.log('[SAVE] Save já em andamento — ignorando chamada duplicada.');
+    return;
+  }
+  _saveLock = true;
+  try {
+    await state.model.save(CONFIG.modelDir);
+    await saveVocab(state.vocab);
+    state.lastSaveCycle = state.cycle;
+    await reportStatus('periodic');
+  } catch (err) {
+    console.error('[SAVE] Falha ao salvar:', err.message);
+  } finally {
+    _saveLock = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Servidor HTTP — endpoint para o NEXUS chamar geração
 // ---------------------------------------------------------------------------
 
@@ -411,6 +440,13 @@ async function scheduler() {
 // ---------------------------------------------------------------------------
 
 async function runMode(mode, ctx = {}) {
+  // Guard: se outro ciclo ainda está treinando, ignora este
+  if (_trainLock) {
+    const tag = ctx.tag || '';
+    console.log(`${tag} trainLock ativo (ciclo anterior ainda treinando) — ${mode} ignorado`);
+    return;
+  }
+
   const { tag = '', episodes = [] } = ctx;
   const t0 = Date.now();
   let pairs = [];
@@ -439,8 +475,6 @@ async function runMode(mode, ctx = {}) {
       const vocabBefore = state.vocab.size;
       pairs = await fetchWebPatterns(state.db, state.vocab, 1);
       desc  = `web crawl → ${pairs.length} pares`;
-      // Sempre verificar crescimento de vocab, mesmo sem pairs
-      // O fetchWebPatterns adiciona tokens ao vocab independentemente de gerar pares
       if (state.vocab.size > vocabBefore) {
         await saveVocab(state.vocab);
         await maybeRebuildForVocabGrowth();
@@ -456,7 +490,15 @@ async function runMode(mode, ctx = {}) {
 
   if (pairs.length > 0) {
     shuffleArray(pairs);
-    const result = await state.model.trainBatch(pairs, 3);
+
+    _trainLock = true;
+    let result;
+    try {
+      result = await state.model.trainBatch(pairs, 3);
+    } finally {
+      _trainLock = false;
+    }
+
     state.metrics.lastLoss     = result.loss;
     state.metrics.lastAccuracy = result.accuracy;
     state.metrics.trainCycles++;
@@ -468,10 +510,7 @@ async function runMode(mode, ctx = {}) {
     console.log(`${tag} ✓ ${desc} | loss=${loss} acc=${acc} | ${elapsed}s`);
 
     if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
-      await state.model.save(CONFIG.modelDir);
-      await saveVocab(state.vocab);
-      state.lastSaveCycle = state.cycle;
-      await reportStatus(mode);
+      await safeSave();
     }
   } else {
     console.log(`${tag} Nenhum dado disponível para ${mode}`);
@@ -596,14 +635,26 @@ async function main() {
   }, CONFIG.intervalMs);
 
   process.on('SIGTERM', async () => {
-    console.log('\n[WORKER] SIGTERM — salvando...');
+    console.log('\n[WORKER] SIGTERM — aguardando conclusão do ciclo...');
+
+    // Espera o fit() em andamento terminar (máx 90s) antes de salvar
+    // Evita que o save capture pesos em estado intermediário do treinamento
+    const deadline = Date.now() + 90_000;
+    while (_trainLock && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (_trainLock) {
+      console.warn('[WORKER] Timeout aguardando trainLock. Salvando mesmo assim.');
+    }
+
+    await safeSave();
+
     try {
-      await state.model.save(CONFIG.modelDir);
-      await saveVocab(state.vocab);
       await state.db.collection('akie_worker_status').doc('current').update({
         status: 'stopped', stopped_at: new Date().toISOString(),
       });
-    } catch (e) { /* ignora */ }
+    } catch { /* ignora */ }
+
     process.exit(0);
   });
 }
