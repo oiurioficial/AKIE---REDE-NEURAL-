@@ -279,6 +279,10 @@ function startHttpServer() {
     console.log(`[HTTP] Servidor listening na porta ${CONFIG.httpPort}`);
   });
 
+  // Timeout de 120s: evita que treinos pesados travem conexões pendentes
+  server.timeout = 120_000;
+  server.keepAliveTimeout = 65_000;
+
   server.on('error', err => {
     console.error('[HTTP] Erro no servidor:', err.message);
   });
@@ -511,7 +515,9 @@ async function runMode(mode, ctx = {}) {
     }
 
     case MODE.CONSOLIDATION: {
-      const sentences = await fetchGraphSentences(state.db, 300);
+      // Cap reduzido: 80 frases/ciclo (era 300) — evita timeout de CPU no Railway.
+      // O grafo cresce incrementalmente; 80 frases processam em <15s na CPU contêiner.
+      const sentences = await fetchGraphSentences(state.db, 80);
       if (!sentences.length) {
         console.log(`${tag} Grafo vazio — pulando consolidação`);
         return;
