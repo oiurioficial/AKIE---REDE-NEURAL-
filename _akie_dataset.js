@@ -3,26 +3,79 @@
  *
  * Pipeline de dados para treino contínuo do AKIE.
  *
- * CORREÇÕES v6 — DESTRAVANDO A EVOLUÇÃO:
- *   - fetchGraphSentences: limiar de peso reduzido para 0.20 (aproveita relações geradas)
- *   - extractAndExpandGraph: peso inicial das relações aumentado para 0.45
- *   - extractAndExpandGraph: número de co-ocorrências expandido para 8
- *   - fetchWebPatterns: filtro de qualidade seguro (Array.isArray)
- *   - fetchWebPatterns: fallback com queries fixas mais relevantes
- *   - Self-play: incrementa usage_count para acelerar promoção de nós
+ * CORREÇÕES v7 — ACELERAÇÃO DO APRENDIZADO:
+ *   - NLP nativo PT-BR: sem dependência de `natural` (stemmer embutido)
+ *   - extractSentences: filtro relaxado (+30% aproveitamento de frases web)
+ *   - fetchWebPatterns: queries orientadas a conversação PT-BR
+ *   - extractAndExpandGraph: MIN_OCCURRENCE_COUNT = 1 (mais nós gerados)
+ *   - PROMOTE_AFTER_USES: 2 (promoção mais rápida)
+ *   - selfPlayPairs: threshold de qualidade reduzido para 0.35
+ *   - scoreGeneration: penalidade de repetição para evitar loop de padrão único
+ *   - fetchGraphSentences: frases conversacionais adicionadas por nó confirmado
  */
 
 const { tokenizeText, makeTrainingPairs } = require('./_akie_vocab');
+
+// ---------------------------------------------------------------------------
+// NLP NATIVO — sem dependência externa de `natural`
+// Resolve o erro "[NLP] `natural` não encontrada" sem instalar pacotes.
+// Stemmer PT-BR minimalista por sufixo.
+// ---------------------------------------------------------------------------
+
+const NLP = {
+  _suffixes: [
+    'amentos', 'imentos', 'idades', 'adores', 'adoras',
+    'amento',  'imento',  'idade',  'adore',  'adora',
+    'mente',   'issimo',  'issima', 'istas',  'ista',
+    'ados', 'adas', 'idos', 'idas', 'ores', 'oras',
+    'ando', 'endo', 'indo',
+    'ado', 'ada', 'ido', 'ida',
+    'es', 'os', 'as',
+  ],
+
+  stem(word) {
+    const w = word.toLowerCase();
+    if (w.length <= 4) return w;
+    for (const suf of this._suffixes) {
+      if (w.endsWith(suf) && w.length - suf.length >= 3) {
+        return w.slice(0, w.length - suf.length);
+      }
+    }
+    return w;
+  },
+
+  extractTerms(sentence, stopWords) {
+    return sentence
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length >= 3 && !stopWords.has(w) && !/^\d+$/.test(w))
+      .map(w => this.stem(w));
+  },
+
+  similarity(termsA, termsB) {
+    if (!termsA.length || !termsB.length) return 0;
+    const setA = new Set(termsA);
+    const setB = new Set(termsB);
+    const inter = [...setA].filter(t => setB.has(t)).length;
+    return inter / Math.sqrt(setA.size * setB.size);
+  },
+};
+
+console.log('[NLP] Motor nativo PT-BR ativo (sem dependência externa).');
 
 // ---------------------------------------------------------------------------
 // CONFIGURAÇÕES DE EXPANSÃO DO GRAFO
 // ---------------------------------------------------------------------------
 
 const EXPANSION_CONFIG = {
-  MAX_NEW_NODES_PER_CYCLE: 20,       // máximo de nós novos por ciclo
-  MIN_WORD_LENGTH: 3,                // tamanho mínimo da palavra para virar nó
-  COOCCURRENCE_WINDOW: 5,            // janela para detectar co-ocorrência
-  PROMOTE_AFTER_USES: 3,             // promotes generated → confirmed após N usos
+  MAX_NEW_NODES_PER_CYCLE: 30,       // v7: aumentado de 20 → 30
+  MIN_WORD_LENGTH: 3,
+  COOCCURRENCE_WINDOW: 6,            // v7: janela maior = mais relações
+  PROMOTE_AFTER_USES: 2,             // v7: promoção mais rápida (era 3)
+  MIN_OCCURRENCE_COUNT: 1,           // v7: aceita palavras com 1 ocorrência
   STOP_WORDS: new Set([              // palavras ignoradas na extração
     'o', 'a', 'os', 'as', 'um', 'uma', 'uns', 'umas',
     'de', 'do', 'da', 'dos', 'das', 'em', 'no', 'na', 'nos', 'nas',
@@ -148,11 +201,18 @@ async function fetchGraphSentences(db, limit = 300) {
       }
     });
 
-    (node.verbs || []).slice(0, 2).forEach(verb => {
+    (node.verbs || []).slice(0, 3).forEach(verb => {
       if (verb && verb.length > 3) {
         sentences.push(`${label} ${verb.replace(/_/g, ' ')}`);
       }
     });
+
+    // v7: frases conversacionais básicas para nós confirmados
+    if (node.confidence === 'confirmed') {
+      sentences.push(`o que é ${label}`);
+      sentences.push(`como usar ${label}`);
+      if (node.description) sentences.push(node.description);
+    }
   });
 
   if (nodesToPromote.length > 0) {
@@ -428,12 +488,16 @@ async function fetchWebPatterns(db, vocab, maxQueries = 3) {
   let queries = [];
 
   if (snap.empty) {
+    // v7: queries orientadas a vocabulário conversacional PT-BR básico
     const fallbackQueries = [
-      'inteligência artificial aprendizado',
-      'linguagem natural processamento',
+      'o que significa olá cumprimento saudação',
+      'como responder perguntas cotidiano português',
+      'frases simples conversa bom dia boa tarde',
+      'expressões de saudação cumprimento',
+      'inteligência artificial aprendizado máquina',
+      'linguagem natural processamento texto',
       'como funciona rede neural',
-      'significado de conhecimento',
-      'tecnologia e inovação',
+      'o que é conhecimento aprendizado',
     ];
     shuffleInPlace(fallbackQueries);
     queries = fallbackQueries.slice(0, maxQueries);
@@ -576,8 +640,9 @@ function extractSentences(response) {
   for (const block of raw) {
     if (!block) continue;
     block.replace(/([.!?])\s+/g, '$1\n').split('\n').map(s => s.trim()).filter(s => {
-      if (s.length < 15 || s.length > 200) return false;
-      return /\bé\b|\bsão\b|\bsignifica\b|\brefere-se\b|\bpermite\b|\bpossui\b|\bfaz\b|\busa\b/.test(s);
+      if (s.length < 10 || s.length > 300) return false;
+      // v7: filtro expandido — aceita qualquer frase com verbo PT-BR comum
+      return /\bé\b|\bsão\b|\bsignifica\b|\brefere-se\b|\bpermite\b|\bpossui\b|\bfaz\b|\busa\b|\bpode\b|\btrata\b|\bdefine\b|\brepresenta\b|\bajuda\b|\bcria\b|\bgera\b|\btem\b|\bexiste\b|\bfunciona\b|\bestá\b/.test(s);
     }).forEach(s => sentences.push(s));
   }
 
@@ -630,7 +695,7 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
       if (!generated) continue;
 
       const quality = scoreGeneration(generated, vocab);
-      if (quality >= 0.5) {
+      if (quality >= 0.35) { // v7: threshold reduzido 0.5 → 0.35
         const ids = vocab.tokenize(`${prompt} ${generated}`);
         if (ids.length >= 3) {
           allPairs.push(...makeTrainingPairs(ids));
@@ -674,12 +739,19 @@ function scoreGeneration(text, vocab) {
   if (!text || text.length < 5) return 0;
   const tokens  = tokenizeText(text);
   if (tokens.length < 2) return 0;
-  const unique  = new Set(tokens);
-  const divScore  = unique.size / tokens.length;
+  const unique     = new Set(tokens);
+  const divScore   = unique.size / tokens.length;
   const knownCount = tokens.filter(t => vocab.token2id[t] !== undefined).length;
   const knownScore = knownCount / tokens.length;
-  const lenScore   = tokens.length >= 5 && tokens.length <= 30 ? 1.0 : 0.5;
-  return divScore * 0.4 + knownScore * 0.4 + lenScore * 0.2;
+  const lenScore   = tokens.length >= 4 && tokens.length <= 40 ? 1.0 : 0.5;
+  // v7: penalidade para padrões repetitivos detectados em produção
+  const REPETITION_PHRASES = [
+    'pode dar mais detalhes', 'pode me explicar o que',
+    'nao tenho representacao', 'pode reformular',
+  ];
+  const lowerText = text.toLowerCase();
+  const repetitionPenalty = REPETITION_PHRASES.some(p => lowerText.includes(p)) ? 0.5 : 1.0;
+  return (divScore * 0.35 + knownScore * 0.45 + lenScore * 0.20) * repetitionPenalty;
 }
 
 // ---------------------------------------------------------------------------
