@@ -310,6 +310,22 @@ async function init() {
   }
 
   console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'}`);
+
+  // Seed conversacional — roda sempre que o grafo estiver pequeno (< 50 nós)
+  // Isso cobre resets por upgrade sem depender da flag do Firestore
+  if (state.db) {
+    try {
+      const graphSnap = await state.db.collection('nexus_graph').limit(50).get();
+      if (graphSnap.size < 50) {
+        console.log(`[INIT] Grafo pequeno (${graphSnap.size} nós) — forçando seed conversacional...`);
+        // Apaga flag para permitir reexecução
+        await state.db.collection('akie_worker_status').doc('seed_conversacional').delete().catch(() => {});
+        await runConversationalSeed(state.db);
+      }
+    } catch (e) {
+      console.error('[INIT] Erro ao verificar seed:', e.message);
+    }
+  }
 }
 
 /**
@@ -407,22 +423,29 @@ async function scheduler() {
 
     if (episodes.length > 0) {
       mode = MODE.INTERACTIVE;
-    } else if (state.cycle % CONFIG.consolidationAfter === 0) {
-      mode = MODE.CONSOLIDATION;
-    } else if (state.cycle % CONFIG.expansionAfter === 0) {
-      mode = MODE.EXPANSION;
-    } else if (state.cycle % CONFIG.selfPlayAfter === 0) {
-      mode = MODE.SELF_PLAY;
+    } else {
+      // Rotação explícita a cada 6 ciclos idle:
+      //   slots 1,2,3,6 → CONSOLIDATION
+      //   slot  4       → EXPANSION
+      //   slot  5       → SELF_PLAY (só se já treinou algo)
+      const slot = ((state.idleCycles - 1) % 6) + 1;
+      if (slot === 4) {
+        mode = MODE.EXPANSION;
+      } else if (slot === 5 && state.model.trainSteps > 50) {
+        mode = MODE.SELF_PLAY;
+      } else {
+        mode = MODE.CONSOLIDATION;
+      }
     }
 
     // Executar modo
     await runMode(mode, { tag: `[${state.cycle}]`, episodes });
 
-    // Incrementar idle_cycles se nada foi feito
-    if (episodes.length === 0 && mode === MODE.INTERACTIVE) {
-      state.idleCycles++;
-    } else {
+    // idleCycles conta ciclos consecutivos sem interação real de usuário
+    if (episodes.length > 0) {
       state.idleCycles = 0;
+    } else {
+      state.idleCycles++;
     }
 
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
