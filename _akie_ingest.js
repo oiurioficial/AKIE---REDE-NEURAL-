@@ -501,18 +501,33 @@ function readBatch(filePath, cursor, batchSize) {
 
 function sentencesToTrainingPairs(sentences, vocab) {
   const allPairs = [];
+  const MAX_SEQ  = 64;
 
-  for (const sentence of sentences) {
-    const tokens = tokenizeText(sentence);
-    if (tokens.length < 2) continue;
+  // Adicionar todos os tokens ao vocabulário primeiro
+  for (const s of sentences) vocab.addTokens(tokenizeText(s));
 
-    vocab.addTokens(tokens);
+  // Parear frases consecutivas como turnos u:/a:
+  // Par i=user, i+1=resposta — dentro de categorias temáticas já são plausíveis
+  for (let i = 0; i + 1 < sentences.length; i += 2) {
+    const userText = sentences[i].trim();
+    const respText = sentences[i + 1].trim();
+    if (!userText || !respText) continue;
 
-    const ids = vocab.tokenize(sentence);
-    if (ids.length < 2) continue;
+    const contextTokens  = vocab.tokenize(`u: ${userText}`);
+    const responseTokens = vocab.tokenize(`a: ${respText}`);
+    if (!contextTokens.length || responseTokens.length < 2) continue;
 
-    const pairs = makeTrainingPairs(ids);
-    allPairs.push(...pairs);
+    // Teacher-forcing por posição — formato idêntico ao SYNTHETIC
+    for (let pos = 1; pos < responseTokens.length; pos++) {
+      const prefix    = responseTokens.slice(0, pos);
+      const rawSeq    = [...contextTokens, ...prefix];
+      const truncated = rawSeq.slice(-(MAX_SEQ - 1));
+      const padded    = [
+        ...Array(Math.max(0, MAX_SEQ - truncated.length)).fill(0),
+        ...truncated,
+      ];
+      allPairs.push({ x: padded, y: responseTokens[pos] });
+    }
   }
 
   return allPairs;
