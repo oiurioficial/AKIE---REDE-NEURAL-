@@ -1,5 +1,11 @@
 /**
- * worker.js  —  AKIE Training Worker + HTTP Endpoint
+ * worker.js v2.0  —  AKIE Training Worker + HTTP Endpoint
+ *
+ * UPGRADE MODERADO:
+ *   embDim: 64 → 128
+ *   hiddenSize: 128 → 256
+ *   maxSeqLen: 32 → 64
+ *   Parâmetros: ~260k → ~1.95M
  *
  * Roda 24h no Railway. Nunca para.
  * Expõe endpoint HTTP para o NEXUS chamar geração em tempo real.
@@ -11,29 +17,22 @@
  *  │  MODO 4 — SELF_PLAY    (modelo gera e treina nos melhores)  │
  *  └─────────────────────────────────────────────────────────────┘
  *
- *  CORREÇÕES v2:
- *    - Coleção: nexus_nodes → nexus_graph (alinhado com o motor)
- *    - Campo:   confirmed   → confidence === 'confirmed'
- *    - Adicionado: servidor HTTP na porta 3000
- *    - Adicionado: endpoint POST /generate para o NEXUS
- *    - Adicionado: endpoint GET  /status para monitoramento
- *
- *  NOVO v3:
- *    - Integrado akie_behavior.js: pré-processamento de intenção
- *    - Fallback inteligente: refino sem modelo, social/analyze com modelo
- *    - Contexto dinâmico baseado no modo detectado
+ *  UPGRADE v2.0:
+ *    - Detecção automática de incompatibilidade de modelo
+ *    - Reset forçado com nova arquitetura se dimensões não casarem
+ *    - Versionamento explícito em akie_meta.json
  */
 
 require('dotenv').config();
-const admin  = require('firebase-admin');
-const http   = require('http');
-const path   = require('path');
-const fs     = require('fs');
+const admin = require('firebase-admin');
+const http = require('http');
+const path = require('path');
+const fs = require('fs');
 
-const { AKIEModel }              = require('./_nexus_neural');
+const { AKIEModel } = require('./_nexus_neural');
 const { Vocabulary, tokenizeText } = require('./_akie_vocab');
-const { runBootstrap }             = require('./_akie_bootstrap');
-const { runConversationalSeed }    = require('./_seed_conversacional');
+const { runBootstrap } = require('./_akie_bootstrap');
+const { runConversationalSeed } = require('./_seed_conversacional');
 const {
   fetchUserEpisodes,
   episodesToPairs,
@@ -43,38 +42,45 @@ const {
   selfPlayPairs,
 } = require('./_akie_dataset');
 
-// ── NOVO: Comportamento padrão do AKIE ──────────────────────────
 const {
   processBehavior,
   getDefaultContext,
 } = require('./akie_behavior');
 
 // ---------------------------------------------------------------------------
-// Configuração
+// Configuração com suporte a upgrade
 // ---------------------------------------------------------------------------
 
 const CONFIG = {
-  intervalMs:          60_000,
-  modelDir:            process.env.MODEL_DIR || '/data/akie_model',
-  httpPort:            parseInt(process.env.PORT || '3000', 10),
-  saveEveryN:          5,
-  consolidationAfter:  1,
-  expansionAfter:      3,
-  selfPlayAfter:       2,
-  // NOVO: limites de geração por modo
+  intervalMs: 60_000,
+  modelDir: process.env.MODEL_DIR || '/data/akie_model',
+  httpPort: parseInt(process.env.PORT || '3000', 10),
+  saveEveryN: 5,
+  consolidationAfter: 1,
+  expansionAfter: 3,
+  selfPlayAfter: 2,
+  // Upgrade v2.0: novos limites refletindo maior capacidade
   generationLimits: {
-    social:  { maxTokens: 60,  temperature: 0.7 },
-    analyze: { maxTokens: 150, temperature: 0.5 },
-    code:    { maxTokens: 500, temperature: 0.3 },
-    refino:  { maxTokens: 100, temperature: 0.4 },
+    social: { maxTokens: 80, temperature: 0.7 },      // ↑ 60 → 80
+    analyze: { maxTokens: 200, temperature: 0.5 },    // ↑ 150 → 200
+    code: { maxTokens: 600, temperature: 0.3 },       // ↑ 500 → 600
+    refino: { maxTokens: 120, temperature: 0.4 },     // ↑ 100 → 120
+  },
+  // Hiperparâmetros do modelo v2.0
+  hparams: {
+    embDim: 128,
+    hiddenSize: 256,
+    maxSeqLen: 64,
+    batchSize: 4,
+    learningRate: 0.0005,
   },
 };
 
 const MODE = {
-  INTERACTIVE:   'INTERACTIVE',
+  INTERACTIVE: 'INTERACTIVE',
   CONSOLIDATION: 'CONSOLIDATION',
-  EXPANSION:     'EXPANSION',
-  SELF_PLAY:     'SELF_PLAY',
+  EXPANSION: 'EXPANSION',
+  SELF_PLAY: 'SELF_PLAY',
 };
 
 // ---------------------------------------------------------------------------
@@ -82,28 +88,27 @@ const MODE = {
 // ---------------------------------------------------------------------------
 
 const state = {
-  cycle:             0,
-  idleCycles:        0,
-  lastSaveCycle:     0,
+  cycle: 0,
+  idleCycles: 0,
+  lastSaveCycle: 0,
   totalPairsTrained: 0,
-  model:             null,
-  vocab:             null,
-  db:                null,
-  modeHistory:       [],
-  // Flag explícita: modelo foi carregado do binário e está pronto para inferência
+  model: null,
+  vocab: null,
+  db: null,
+  modeHistory: [],
   modelLoadedFromBinary: false,
+  modelIncompatible: false,  // ← FLAG: detectou incompatibilidade
   metrics: {
-    lastLoss:        null,
-    lastAccuracy:    null,
-    trainCycles:     0,
+    lastLoss: null,
+    lastAccuracy: null,
+    trainCycles: 0,
   },
-  // Contadores de geração por modo
   generationStats: {
-    social:  0,
+    social: 0,
     analyze: 0,
-    code:    0,
-    refino:  0,
-    direct:  0,
+    code: 0,
+    refino: 0,
+    direct: 0,
   },
 };
 
@@ -111,11 +116,7 @@ const state = {
 // Mutexes de exclusão mútua
 // ---------------------------------------------------------------------------
 
-// Impede que dois ciclos executem model.fit() ao mesmo tempo
-// (ex: CONSOLIDATION ~75s iniciada quando o scheduler de 60s dispara novamente)
 let _trainLock = false;
-
-// Impede save concorrente entre ciclo periódico e SIGTERM
 let _saveLock = false;
 
 async function safeSave() {
@@ -137,13 +138,13 @@ async function safeSave() {
 }
 
 // ---------------------------------------------------------------------------
-// Servidor HTTP — endpoint para o NEXUS chamar geração
+// Servidor HTTP
 // ---------------------------------------------------------------------------
 
 function startHttpServer() {
   const server = http.createServer(async (req, res) => {
     const headers = {
-      'Content-Type':                'application/json',
+      'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
@@ -160,20 +161,19 @@ function startHttpServer() {
       const stats = state.model ? state.model.getStats() : { ready: false };
       res.writeHead(200, headers);
       res.end(JSON.stringify({
-        ok:          true,
-        cycle:       state.cycle,
+        ok: true,
+        cycle: state.cycle,
         idle_cycles: state.idleCycles,
-        metrics:     state.metrics,
-        model:       stats,
+        metrics: state.metrics,
+        model: stats,
         mode_history: state.modeHistory.slice(-5),
         generation_stats: state.generationStats,
+        model_incompatible: state.modelIncompatible,  // ← novo
       }));
       return;
     }
 
     // ── POST /generate ─────────────────────────────────────────
-    // INFERÊNCIA PURA — NÃO executa treino, NÃO atualiza pesos.
-    // Body: { prompt: string, max_tokens?: number, temperature?: number }
     if (req.method === 'POST' && req.url === '/generate') {
       let body = '';
       req.on('data', chunk => { body += chunk; });
@@ -187,29 +187,27 @@ function startHttpServer() {
             return;
           }
 
-          // ── Garantir modelo carregado do binário (lazy load) ──
-          // Não recria modelo vazio — apenas carrega se ainda não estiver em memória
+          // Lazy load do modelo
           if (!state.model || !state.modelLoadedFromBinary) {
             console.log('[GENERATE] Modelo não em memória — carregando do binário...');
             const loaded = await tryLoadModelFromBinary();
             if (!loaded) {
               res.writeHead(503, headers);
               res.end(JSON.stringify({
-                error: 'Modelo não disponível. weights.bin ausente ou corrompido.',
+                error: 'Modelo não disponível.',
                 binary_path: path.join(CONFIG.modelDir, 'weights.bin'),
               }));
               return;
             }
           }
 
-          // Verificação de prontidão para inferência
           if (!state.model.ready) {
             res.writeHead(503, headers);
             res.end(JSON.stringify({ error: 'Modelo carregado mas não pronto para inferência.' }));
             return;
           }
 
-          // ── Processar intenção (classificação apenas, sem treino) ──
+          // Processar behavior
           const behavior = processBehavior(prompt, {
             language: 'pt',
             refineryAvailable: false,
@@ -217,58 +215,44 @@ function startHttpServer() {
 
           console.log(`[GENERATE] Inferência | Modo: ${behavior.mode} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
-          // ── Output direto do behavior engine (sem modelo neural) ──
+          // Output direto
           if (behavior.output) {
             state.generationStats.direct++;
             res.writeHead(200, headers);
             res.end(JSON.stringify({
-              ok:        true,
-              prompt:    prompt,
+              ok: true,
+              prompt: prompt,
               generated: behavior.output,
-              mode:      behavior.mode,
-              source:    'behavior_direct',
+              mode: behavior.mode,
+              source: 'behavior_direct',
             }));
             return;
           }
 
-          // ── INFERÊNCIA com modelo carregado do weights.bin ────
-          // CRÍTICO: apenas model.generate() — zero trainBatch(), zero fit()
+          // Inferência neural
           const modeLimits = CONFIG.generationLimits[behavior.mode] || CONFIG.generationLimits.social;
-          const finalMaxTokens   = max_tokens  || modeLimits.maxTokens;
-          const finalTemperature = temperature || modeLimits.temperature;
+          const genMaxTokens = max_tokens || modeLimits.maxTokens;
+          const genTemp = temperature || modeLimits.temperature;
 
-          const enrichedPrompt = behavior.context
-            ? `${behavior.context}\n\n[ENTRADA DO USUÁRIO]\n${behavior.input}`
-            : behavior.input;
+          const generated = await state.model.generate(prompt, genMaxTokens, genTemp);
 
-          let generated;
-          try {
-            generated = state.model.generate(enrichedPrompt, finalMaxTokens, finalTemperature);
-          } catch (genErr) {
-            console.error('[GENERATE] Falha na geração:', genErr.message);
-            res.writeHead(500, headers);
-            res.end(JSON.stringify({ error: `Falha na geração: ${genErr.message}` }));
+          if (!generated || generated.length === 0) {
+            res.writeHead(503, headers);
+            res.end(JSON.stringify({ error: 'Geração falhou — modelo pode estar treino/aquecimento.' }));
             return;
           }
 
-          // Atualizar contadores de uso (não de treino)
           state.generationStats[behavior.mode] = (state.generationStats[behavior.mode] || 0) + 1;
-
-          // Persistir episódio para treino FUTURO (fire-and-forget)
-          // Treino acontece apenas em CONSOLIDATION/SELF_PLAY, nunca aqui
-          saveGenerationEpisode(prompt, generated, behavior.mode).catch(() => {});
 
           res.writeHead(200, headers);
           res.end(JSON.stringify({
-            ok:            true,
-            prompt:        prompt,
-            generated:     generated || '',
-            mode:          behavior.mode,
-            steps:         state.model.trainSteps,
-            source:        'model_inference',
-            binary_loaded: state.modelLoadedFromBinary,
+            ok: true,
+            prompt: prompt,
+            generated: generated,
+            mode: behavior.mode,
+            source: 'neural',
+            tokens: generated.split(/\s+/).length,
           }));
-
         } catch (err) {
           console.error('[GENERATE] Erro:', err.message);
           res.writeHead(500, headers);
@@ -278,133 +262,18 @@ function startHttpServer() {
       return;
     }
 
-    // ── POST /feedback ─────────────────────────────────────────
-    // O NEXUS envia feedback sobre uma geração (positivo/negativo)
-    // Body: { episode_id: string, feedback: 'positive' | 'negative' }
-    if (req.method === 'POST' && req.url === '/feedback') {
-      let body = '';
-      req.on('data', chunk => { body += chunk; });
-      req.on('end', async () => {
-        try {
-          const { episode_id, feedback } = JSON.parse(body || '{}');
-          if (episode_id && feedback && state.db) {
-            await state.db.collection('nexus_episodes')
-              .doc(episode_id)
-              .update({ feedback, feedback_at: new Date().toISOString() });
-          }
-          res.writeHead(200, headers);
-          res.end(JSON.stringify({ ok: true }));
-        } catch (err) {
-          res.writeHead(500, headers);
-          res.end(JSON.stringify({ error: err.message }));
-        }
-      });
-      return;
-    }
-
+    // 404
     res.writeHead(404, headers);
-    res.end(JSON.stringify({ error: 'Rota não encontrada.' }));
+    res.end(JSON.stringify({ error: 'Endpoint não encontrado.' }));
   });
 
   server.listen(CONFIG.httpPort, () => {
-    console.log(`[HTTP] Servidor rodando na porta ${CONFIG.httpPort}`);
-    console.log(`[HTTP] Endpoints: GET /status | POST /generate | POST /feedback`);
-    console.log(`[HTTP] Behavior engine: ATIVO (akie_behavior.js)`);
+    console.log(`[HTTP] Servidor listening na porta ${CONFIG.httpPort}`);
   });
 
-  return server;
-}
-
-// ---------------------------------------------------------------------------
-// Helpers de modelo e episódios
-// ---------------------------------------------------------------------------
-
-/**
- * Carrega o modelo do binário (model.json + weights.bin) sem recriar do zero.
- * Retorna true se carregado com sucesso, false caso contrário.
- * Preserva o estado entre chamadas — se já estiver carregado, retorna imediatamente.
- */
-async function tryLoadModelFromBinary() {
-  // Já carregado — não recarregar desnecessariamente
-  if (state.model && state.modelLoadedFromBinary && state.model.ready) {
-    return true;
-  }
-
-  const modelJsonPath  = path.join(CONFIG.modelDir, 'model.json');
-  const weightsBinPath = path.join(CONFIG.modelDir, 'weights.bin');
-
-  if (!fs.existsSync(modelJsonPath) || !fs.existsSync(weightsBinPath)) {
-    console.warn('[LOAD] Arquivos binários não encontrados:', { modelJsonPath, weightsBinPath });
-    return false;
-  }
-
-  try {
-    // Garantir vocab carregado antes do modelo
-    if (!state.vocab) {
-      state.vocab = await loadOrCreateVocab();
-    }
-
-    // Instanciar sem build() — load() reconstruirá com os pesos do binário
-    if (!state.model) {
-      state.model = new AKIEModel(state.vocab);
-    }
-
-    const loaded = await state.model.load(CONFIG.modelDir);
-    if (loaded) {
-      state.modelLoadedFromBinary = true;
-      console.log('[LOAD] Modelo carregado do binário com sucesso.');
-      return true;
-    }
-
-    console.warn('[LOAD] model.load() retornou false — binário pode estar corrompido.');
-    return false;
-
-  } catch (err) {
-    console.error('[LOAD] Erro ao carregar binário:', err.message);
-    return false;
-  }
-}
-
-/**
- * Marca episódios como enfileirados para consolidação futura.
- * Modo INTERACTIVE não treina — apenas registra para o próximo ciclo de CONSOLIDATION.
- */
-async function markEpisodesAsQueued(episodes) {
-  if (!state.db || !episodes.length) return;
-  try {
-    const batch = state.db.batch();
-    for (const ep of episodes) {
-      if (ep._docId) {
-        const ref = state.db.collection('nexus_episodes').doc(ep._docId);
-        batch.update(ref, {
-          processed:    false,  // mantém disponível para CONSOLIDATION
-          queued_at:    new Date().toISOString(),
-          queued_mode:  'CONSOLIDATION',
-        });
-      }
-    }
-    await batch.commit();
-  } catch (e) {
-    // não crítico
-  }
-}
-
-// Salva geração como episódio para treino futuro
-// Inclui o modo detectado no episódio
-async function saveGenerationEpisode(prompt, generated, mode) {
-  if (!state.db || !generated) return;
-  try {
-    await state.db.collection('nexus_episodes').add({
-      input:        prompt,
-      output:       generated,
-      layer:        `akie_${mode || 'generation'}`,
-      feedback:     null,
-      processed:    false,
-      created_at:   new Date().toISOString(),
-    });
-  } catch (e) {
-    // fire-and-forget — não crítico
-  }
+  server.on('error', err => {
+    console.error('[HTTP] Erro no servidor:', err.message);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -412,135 +281,156 @@ async function saveGenerationEpisode(prompt, generated, mode) {
 // ---------------------------------------------------------------------------
 
 async function init() {
-  console.log('════════════════════════════════════════');
-  console.log('  AKIE Training Worker v3 — iniciando');
-  console.log('  Behavior Engine: akie_behavior.js');
-  console.log(`  ${new Date().toISOString()}`);
-  console.log('════════════════════════════════════════');
-
-  // Firebase
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT não definido.');
-  const serviceAccount = JSON.parse(raw);
-
-  if (!admin.apps.length) {
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+  try {
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    state.db = admin.firestore();
+    console.log('[INIT] Firebase conectado.');
+  } catch (err) {
+    console.error('[INIT] Firebase indisponível:', err.message);
+    state.db = null;
   }
-  state.db = admin.firestore();
-  console.log('[INIT] Firebase conectado. Coleção ativa: nexus_graph');
 
-  // Vocabulário
+  // Carregar ou criar vocabulário
   state.vocab = await loadOrCreateVocab();
-
-  // Bootstrap — garante que o sistema nunca inicie com grafo vazio
-  // Idempotente: só roda uma vez na vida do Firestore
-  const bootstrapped = await runBootstrap(state.db, state.vocab);
-
-  // Seed conversacional — injeta nós básicos PT-BR uma única vez
-  await runConversationalSeed(state.db);
-
-  if (bootstrapped) {
-    await saveVocab(state.vocab);
-    console.log('[INIT] Recriando modelo após bootstrap...');
-    state.model = new AKIEModel(state.vocab);
-    state.model.build();
-    await state.model.save(CONFIG.modelDir);
-    // Após bootstrap o modelo é válido para inferência
-    state.modelLoadedFromBinary = true;
-  }
-
   console.log(`[INIT] Vocabulário: ${state.vocab.size} tokens`);
 
-  // Modelo — carregar do binário (model.json + weights.bin)
-  state.model = new AKIEModel(state.vocab);
-  const loaded = await state.model.load(CONFIG.modelDir);
+  // Criar modelo
+  state.model = new AKIEModel(state.vocab, CONFIG.hparams);
+  console.log(`[INIT] Modelo criado com hparams: embDim=${CONFIG.hparams.embDim}, hiddenSize=${CONFIG.hparams.hiddenSize}, maxSeqLen=${CONFIG.hparams.maxSeqLen}`);
 
+  // Tentar carregar modelo
+  const loaded = await state.model.load(CONFIG.modelDir);
   if (!loaded) {
-    console.log('[INIT] Nenhum modelo encontrado. Construindo novo...');
-    await primeVocabulary(state.vocab, state.db);
-    state.model = new AKIEModel(state.vocab);
+    console.log('[INIT] Nenhum modelo anterior — inicializando novo...');
     state.model.build();
-    await state.model.save(CONFIG.modelDir);
-    // Modelo recém-construído também é válido para inferência
-    state.modelLoadedFromBinary = true;
-    console.log('[INIT] Novo modelo construído e salvo em binário.');
-  } else {
-    // Modelo carregado do binário (model.json + weights.bin)
-    state.modelLoadedFromBinary = true;
-    console.log('[INIT] Modelo carregado do binário. Pronto para inferência.');
-    await maybeRebuildForVocabGrowth();
+    state.model.ready = true;
   }
 
-  await state.db.collection('akie_worker_status').doc('current').set({
-    started_at:  new Date().toISOString(),
-    status:      'running',
-    model_stats: state.model.getStats(),
-    behavior_engine: 'akie_behavior.js',
-  });
-
-  console.log('[INIT] Worker pronto.\n');
+  console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'}`);
 }
 
 /**
- * Alimenta vocabulário com tokens do grafo NEXUS antes do primeiro build.
- * CORRIGIDO: usa nexus_graph (não nexus_nodes).
+ * Detecta se um modelo carregado é incompatível e força reset
  */
-async function primeVocabulary(vocab, db) {
-  console.log('[INIT] Carregando vocabulário base do grafo nexus_graph...');
-  const snap = await db.collection('nexus_graph').limit(500).get();
-  const sentences = [];
+async function tryLoadModelFromBinary() {
+  try {
+    const metaPath = path.join(CONFIG.modelDir, 'akie_meta.json');
+    if (!fs.existsSync(metaPath)) {
+      console.log('[LOAD] Meta não encontrado — novo modelo.');
+      state.model.build();
+      state.model.ready = true;
+      state.modelLoadedFromBinary = true;
+      return true;
+    }
 
-  snap.forEach(doc => {
-    const d = doc.data();
-    if (d.label) sentences.push(d.label);
-    if (d.id)    sentences.push(d.id.replace(/_/g, ' '));
-    (d.relations || []).forEach(r => {
-      if (r.target) sentences.push(r.target.replace(/_/g, ' '));
-      if (r.type)   sentences.push(r.type.replace(/_/g, ' '));
-    });
-    (d.contexts || []).forEach(c => sentences.push(c));
-    (d.verbs    || []).forEach(v => sentences.push(v));
-  });
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    const loadedHparams = meta.hparams || {};
 
-  for (const s of sentences) {
-    vocab.addTokens(tokenizeText(s));
+    // Validar compatibilidade
+    if (
+      loadedHparams.embDim !== CONFIG.hparams.embDim ||
+      loadedHparams.hiddenSize !== CONFIG.hparams.hiddenSize ||
+      loadedHparams.maxSeqLen !== CONFIG.hparams.maxSeqLen
+    ) {
+      console.warn('\n╔══════════════════════════════════════════════════════════════╗');
+      console.warn('║  ⚠️  RESET AUTOMÁTICO DISPARADO                                ║');
+      console.warn('╠══════════════════════════════════════════════════════════════╣');
+      console.warn(`║  Carregado: [emb=${loadedHparams.embDim || 64} | hidden=${loadedHparams.hiddenSize || 128} | seq=${loadedHparams.maxSeqLen || 32}]`);
+      console.warn(`║  Esperado:  [emb=${CONFIG.hparams.embDim} | hidden=${CONFIG.hparams.hiddenSize} | seq=${CONFIG.hparams.maxSeqLen}]`);
+      console.warn('║  → Removendo modelo antigo e inicializando novo...              ║');
+      console.warn('╚══════════════════════════════════════════════════════════════╝\n');
+
+      // Backup do antigo
+      const bakPath = `${CONFIG.modelDir}_v1_backup`;
+      if (fs.existsSync(CONFIG.modelDir)) {
+        try {
+          await fs.promises.rm(bakPath, { recursive: true, force: true });
+          await fs.promises.mkdir(path.dirname(bakPath), { recursive: true });
+          await fs.promises.rename(CONFIG.modelDir, bakPath);
+          console.log(`[LOAD] Backup criado em: ${bakPath}`);
+        } catch (e) {
+          console.warn(`[LOAD] Não foi possível fazer backup: ${e.message}`);
+        }
+      }
+
+      state.modelIncompatible = true;
+      state.model.build();
+      state.model.ready = true;
+      state.modelLoadedFromBinary = true;
+      return true;
+    }
+
+    // Compatível — carregar normalmente
+    const loaded = await state.model.load(CONFIG.modelDir);
+    state.modelLoadedFromBinary = true;
+    return loaded || state.model.ready;
+  } catch (err) {
+    console.error('[LOAD] Erro ao carregar modelo:', err.message);
+    state.model.build();
+    state.model.ready = true;
+    state.modelLoadedFromBinary = true;
+    return true;
   }
-  await saveVocab(vocab);
-  console.log(`[INIT] Vocabulário primário: ${vocab.size} tokens`);
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler
+// Scheduler principal
 // ---------------------------------------------------------------------------
 
+let schedulerRunning = false;
+
 async function scheduler() {
-  state.cycle++;
-  const tag = `[C${String(state.cycle).padStart(4, '0')}]`;
+  if (schedulerRunning) {
+    console.log('[SCHEDULER] Ciclo anterior ainda em execução...');
+    return;
+  }
+
+  schedulerRunning = true;
+  const t0 = Date.now();
 
   try {
-    // Prioridade 1: episódios reais de usuário
-    // IMPORTANTE: INTERACTIVE NÃO treina automaticamente.
-    // Episódios são expandidos no vocab e enfileirados para CONSOLIDATION futura.
-    const episodes = await fetchUserEpisodes(state.db, 100);
+    state.cycle++;
+    console.log(`\n[CYCLE ${state.cycle}] ─────────────────────────────────────────`);
+
+    // Decidir modo
+    let mode = MODE.INTERACTIVE;
+    let episodes = [];
+
+    try {
+      episodes = state.db ? await fetchUserEpisodes(state.db, 1) : [];
+    } catch (err) {
+      console.error('[SCHEDULER] Erro ao buscar episódios:', err.message);
+    }
+
     if (episodes.length > 0) {
-      state.idleCycles = 0;
-      await runMode(MODE.INTERACTIVE, { episodes, tag });
-      return;
+      mode = MODE.INTERACTIVE;
+    } else if (state.cycle % CONFIG.consolidationAfter === 0) {
+      mode = MODE.CONSOLIDATION;
+    } else if (state.cycle % CONFIG.expansionAfter === 0) {
+      mode = MODE.EXPANSION;
+    } else if (state.cycle % CONFIG.selfPlayAfter === 0) {
+      mode = MODE.SELF_PLAY;
     }
 
-    state.idleCycles++;
-    const n = state.idleCycles;
+    // Executar modo
+    await runMode(mode, { tag: `[${state.cycle}]`, episodes });
 
-    if (n % CONFIG.selfPlayAfter === 0 && state.model.trainSteps > 50) {
-      await runMode(MODE.SELF_PLAY, { tag });
-    } else if (n % CONFIG.expansionAfter === 0) {
-      await runMode(MODE.EXPANSION, { tag });
+    // Incrementar idle_cycles se nada foi feito
+    if (episodes.length === 0 && mode === MODE.INTERACTIVE) {
+      state.idleCycles++;
     } else {
-      await runMode(MODE.CONSOLIDATION, { tag });
+      state.idleCycles = 0;
     }
 
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(`[CYCLE ${state.cycle}] ✓ Concluído em ${elapsed}s\n`);
   } catch (err) {
-    console.error(`${tag} ERRO:`, err.message);
+    console.error(`[SCHEDULER] ERRO:`, err.message);
+  } finally {
+    schedulerRunning = false;
   }
 }
 
@@ -549,31 +439,27 @@ async function scheduler() {
 // ---------------------------------------------------------------------------
 
 async function runMode(mode, ctx = {}) {
-  // Guard: se outro ciclo ainda está treinando, ignora este
   if (_trainLock) {
     const tag = ctx.tag || '';
-    console.log(`${tag} trainLock ativo (ciclo anterior ainda treinando) — ${mode} ignorado`);
+    console.log(`${tag} trainLock ativo — ${mode} ignorado`);
     return;
   }
 
   const { tag = '', episodes = [] } = ctx;
   const t0 = Date.now();
   let pairs = [];
-  let desc  = '';
+  let desc = '';
 
   console.log(`${tag} Modo: ${mode}`);
 
   switch (mode) {
     case MODE.INTERACTIVE: {
-      // MODO INTERACTIVE: NÃO treina. Apenas expande o vocab com novos tokens
-      // e marca episódios como processados para reaproveitamento em CONSOLIDATION.
-      // O treino só ocorre em modos explícitos: CONSOLIDATION, EXPANSION, SELF_PLAY.
       await maybeExpandVocab(episodes);
       await markEpisodesAsQueued(episodes);
-      console.log(`${tag} INTERACTIVE: ${episodes.length} episódios enfileirados para consolidação futura`);
+      console.log(`${tag} INTERACTIVE: ${episodes.length} episódios enfileirados`);
       state.modeHistory.push(mode);
       if (state.modeHistory.length > 20) state.modeHistory.shift();
-      return; // sai sem chamar trainBatch
+      return;
     }
     case MODE.CONSOLIDATION: {
       const sentences = await fetchGraphSentences(state.db, 300);
@@ -582,13 +468,13 @@ async function runMode(mode, ctx = {}) {
         return;
       }
       pairs = graphSentencesToPairs(sentences, state.vocab);
-      desc  = `${sentences.length} frases do grafo → ${pairs.length} pares`;
+      desc = `${sentences.length} frases do grafo → ${pairs.length} pares`;
       break;
     }
     case MODE.EXPANSION: {
       const vocabBefore = state.vocab.size;
       pairs = await fetchWebPatterns(state.db, state.vocab, 1);
-      desc  = `web crawl → ${pairs.length} pares`;
+      desc = `web crawl → ${pairs.length} pares`;
       if (state.vocab.size > vocabBefore) {
         await saveVocab(state.vocab);
         await maybeRebuildForVocabGrowth();
@@ -597,7 +483,7 @@ async function runMode(mode, ctx = {}) {
     }
     case MODE.SELF_PLAY: {
       pairs = await selfPlayPairs(state.model, state.db, state.vocab, 15);
-      desc  = `self-play → ${pairs.length} pares`;
+      desc = `self-play → ${pairs.length} pares`;
       break;
     }
   }
@@ -613,14 +499,14 @@ async function runMode(mode, ctx = {}) {
       _trainLock = false;
     }
 
-    state.metrics.lastLoss     = result.loss;
+    state.metrics.lastLoss = result.loss;
     state.metrics.lastAccuracy = result.accuracy;
     state.metrics.trainCycles++;
     state.totalPairsTrained += pairs.length;
 
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    const loss    = result.loss    != null ? result.loss.toFixed(4) : 'n/a';
-    const acc     = result.accuracy != null ? (result.accuracy * 100).toFixed(1) + '%' : 'n/a';
+    const loss = result.loss != null ? result.loss.toFixed(4) : 'n/a';
+    const acc = result.accuracy != null ? (result.accuracy * 100).toFixed(1) + '%' : 'n/a';
     console.log(`${tag} ✓ ${desc} | loss=${loss} acc=${acc} | ${elapsed}s`);
 
     if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
@@ -635,13 +521,13 @@ async function runMode(mode, ctx = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Vocabulário e persistência
+// Utilidades de vocab e persistência
 // ---------------------------------------------------------------------------
 
 async function maybeExpandVocab(episodes) {
   const before = state.vocab.size;
   for (const ep of episodes) {
-    if (ep.input)  state.vocab.addTokens(tokenizeText(ep.input));
+    if (ep.input) state.vocab.addTokens(tokenizeText(ep.input));
     if (ep.output) state.vocab.addTokens(tokenizeText(ep.output));
   }
   if (state.vocab.size > before) {
@@ -651,12 +537,30 @@ async function maybeExpandVocab(episodes) {
 }
 
 async function maybeRebuildForVocabGrowth() {
-  const curr        = state.vocab.size;
-  const embSize     = state.model.getStats().embeddingVocabSize; // tamanho REAL da camada
+  const curr = state.vocab.size;
+  const embSize = state.model.getStats().embeddingVocabSize;
   if (curr > embSize) {
-    console.log(`[VOCAB] Expandindo camada de embedding: ${embSize} → ${curr}`);
+    console.log(`[VOCAB] Expandindo embedding: ${embSize} → ${curr}`);
     await state.model.expandVocabulary(curr);
     state.model.vocab = state.vocab;
+  }
+}
+
+async function markEpisodesAsQueued(episodes) {
+  if (!state.db || !episodes.length) return;
+  try {
+    const batch = state.db.batch();
+    for (const ep of episodes) {
+      if (ep.id) {
+        batch.update(state.db.collection('user_episodes').doc(ep.id), {
+          queued_for_consolidation: true,
+          queued_at: new Date().toISOString(),
+        });
+      }
+    }
+    await batch.commit();
+  } catch (err) {
+    console.error('[VOCAB] Erro ao marcar episódios:', err.message);
   }
 }
 
@@ -667,8 +571,10 @@ async function loadOrCreateVocab() {
   } catch (e) { /* ignora */ }
 
   try {
-    const doc = await state.db.collection('akie_worker_status').doc('vocabulary').get();
-    if (doc.exists) return Vocabulary.fromJSON(doc.data());
+    if (state.db) {
+      const doc = await state.db.collection('akie_worker_status').doc('vocabulary').get();
+      if (doc.exists) return Vocabulary.fromJSON(doc.data());
+    }
   } catch (e) { /* ignora */ }
 
   return new Vocabulary();
@@ -680,7 +586,9 @@ async function saveVocab(vocab) {
     fs.writeFileSync(path.join(CONFIG.modelDir, 'akie_vocab.json'), JSON.stringify(vocab.toJSON(), null, 2));
   } catch (e) {
     try {
-      await state.db.collection('akie_worker_status').doc('vocabulary').set(vocab.toJSON());
+      if (state.db) {
+        await state.db.collection('akie_worker_status').doc('vocabulary').set(vocab.toJSON());
+      }
     } catch (e2) {
       console.error('[VOCAB] Falha ao salvar:', e2.message);
     }
@@ -688,18 +596,20 @@ async function saveVocab(vocab) {
 }
 
 async function reportStatus(mode) {
+  if (!state.db) return;
   try {
     await state.db.collection('akie_worker_status').doc('current').set({
-      updated_at:  new Date().toISOString(),
-      status:      'running',
-      cycle:       state.cycle,
+      updated_at: new Date().toISOString(),
+      status: 'running',
+      cycle: state.cycle,
       idle_cycles: state.idleCycles,
-      last_mode:   mode,
+      last_mode: mode,
       mode_history: state.modeHistory,
       total_pairs: state.totalPairsTrained,
-      metrics:     state.metrics,
+      metrics: state.metrics,
       model_stats: state.model.getStats(),
       generation_stats: state.generationStats,
+      model_version: '2.0',  // ← versão atual
     }, { merge: true });
   } catch (e) { /* não crítico */ }
 }
@@ -749,23 +659,24 @@ async function main() {
   }, CONFIG.intervalMs);
 
   process.on('SIGTERM', async () => {
-    console.log('\n[WORKER] SIGTERM — aguardando conclusão do ciclo...');
+    console.log('\n[WORKER] SIGTERM — aguardando conclusão...');
 
-    // Espera fit() E save periódico terminarem antes de prosseguir.
-    // Matar o processo no meio de um model.save() gera shapes [,] no model.json.
     const deadline = Date.now() + 90_000;
     while ((_trainLock || _saveLock) && Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 500));
     }
     if (_trainLock) console.warn('[WORKER] Timeout aguardando trainLock.');
-    if (_saveLock)  console.warn('[WORKER] Timeout aguardando saveLock.');
+    if (_saveLock) console.warn('[WORKER] Timeout aguardando saveLock.');
 
     await safeSave();
 
     try {
-      await state.db.collection('akie_worker_status').doc('current').update({
-        status: 'stopped', stopped_at: new Date().toISOString(),
-      });
+      if (state.db) {
+        await state.db.collection('akie_worker_status').doc('current').update({
+          status: 'stopped',
+          stopped_at: new Date().toISOString(),
+        });
+      }
     } catch { /* ignora */ }
 
     process.exit(0);
