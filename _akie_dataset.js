@@ -149,17 +149,36 @@ async function fetchUserEpisodes(db, limit = 50) {
 
 function episodesToPairs(episodes, vocab) {
   const allPairs = [];
+  const MAX_SEQ  = 64; // deve coincidir com HPARAMS.maxSeqLen
 
   for (const ep of episodes) {
     if (ep.feedback === 'negative') continue;
     if (!ep.input || !ep.output)   continue;
 
-    const fullText = `${ep.input} ${ep.output}`;
-    const ids      = vocab.tokenize(fullText);
-    const pairs    = makeTrainingPairs(ids);
-    const weight   = ep.feedback === 'positive' ? 2 : 1;
+    // Remover prefixos u:/a: que possam vir do sistema antes de reformatar
+    const userText = ep.input.replace(/^u\s*:\s*/i, '').replace(/\n/g, ' ').trim();
+    const respText = ep.output.replace(/^a\s*:\s*/i, '').replace(/\n/g, ' ').trim();
+    if (!userText || !respText) continue;
 
-    for (let i = 0; i < weight; i++) allPairs.push(...pairs);
+    // Formato IDÊNTICO ao SYNTHETIC: "u: {input}" como contexto, "a: {output}" como alvo
+    // Teacher-forcing por posição — garante consistência de distribuição entre modos
+    const contextTokens  = vocab.tokenize(`u: ${userText}`);
+    const responseTokens = vocab.tokenize(`a: ${respText}`);
+    if (!contextTokens.length || responseTokens.length < 2) continue;
+
+    const weight = ep.feedback === 'positive' ? 2 : 1;
+
+    for (let pos = 1; pos < responseTokens.length; pos++) {
+      const prefix    = responseTokens.slice(0, pos);
+      const rawSeq    = [...contextTokens, ...prefix];
+      const truncated = rawSeq.slice(-(MAX_SEQ - 1));
+      const padded    = [
+        ...Array(Math.max(0, MAX_SEQ - truncated.length)).fill(0),
+        ...truncated,
+      ];
+      const pair = { x: padded, y: responseTokens[pos] };
+      for (let w = 0; w < weight; w++) allPairs.push(pair);
+    }
   }
 
   return allPairs;
@@ -691,14 +710,26 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
     const prompt = node.label || (node.id || '').replace(/_/g, ' ');
 
     try {
-      const generated = model.generate(prompt, 20, 0.7);
+      const generated = await model.generate(prompt, 20, 0.7);
       if (!generated) continue;
 
       const quality = scoreGeneration(generated, vocab);
-      if (quality >= 0.35) { // v7: threshold reduzido 0.5 → 0.35
-        const ids = vocab.tokenize(`${prompt} ${generated}`);
-        if (ids.length >= 3) {
-          allPairs.push(...makeTrainingPairs(ids));
+      if (quality >= 0.35) {
+        // Formato consistente com SYNTHETIC: u: {prompt} a: {generated}
+        const contextTokens  = vocab.tokenize(`u: ${prompt}`);
+        const responseTokens = vocab.tokenize(`a: ${generated}`);
+        if (responseTokens.length >= 2) {
+          const MAX_SEQ = 64;
+          for (let pos = 1; pos < responseTokens.length; pos++) {
+            const prefix    = responseTokens.slice(0, pos);
+            const rawSeq    = [...contextTokens, ...prefix];
+            const truncated = rawSeq.slice(-(MAX_SEQ - 1));
+            const padded    = [
+              ...Array(Math.max(0, MAX_SEQ - truncated.length)).fill(0),
+              ...truncated,
+            ];
+            allPairs.push({ x: padded, y: responseTokens[pos] });
+          }
           good++;
           allGeneratedTexts.push(`${prompt} ${generated}`);
           usedNodeIds.add(node.id);
