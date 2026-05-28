@@ -642,10 +642,21 @@ class AKIEModel {
       console.log(`[AKIE] Transformer carregado. (steps: ${this.trainSteps}, embVocab: ${this.embeddingVocabSize})`);
       return true;
       
-    } catch (err) {
-      console.error('[AKIE] Falha ao carregar modelo:', err.message);
-      return false;
+     } catch (err) {
+    console.error(`[AKIE] Falha ao carregar modelo: ${err.message}`);
+    console.log('[AKIE] Modelo corrompido. Limpando diretório para reconstrução...');
+    
+    try {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        fs.unlinkSync(path.join(dir, file));
+      }
+      console.log('[AKIE] Diretório limpo. Um novo modelo será construído.');
+    } catch (cleanErr) {
+      console.error('[AKIE] Erro ao limpar diretório:', cleanErr.message);
     }
+    
+    return false; // Força rebuild limpo
   }
 
   /**
