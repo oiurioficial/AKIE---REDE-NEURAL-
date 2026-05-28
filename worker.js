@@ -1,24 +1,6 @@
 /**
  * worker.js v2.3  —  AKIE Training Worker + HTTP Endpoint
- *
- * MUDANÇAS v2.3:
- *   [FIX-EPISODES] markEpisodesAsQueued: substituído .update() por .set({...}, {merge:true})
- *     → elimina "5 NOT_FOUND: No document to update" para episódios sem doc prévio
- *   [FIX-EXPANSION] EXPANSION agora chama runDataIngestion() (Tatoeba + Conversacional)
- *     → Wikipedia removida, sem mais poluição enciclopédica no grafo
- *   [FIX-CONSOLIDATION-STAGNATION] Mantida detecção de estagnação de v2.2
- *   [FIX-BEHAVIOR-CONFIDENCE] /generate só usa behavior_direct quando confidence > 0.85
- *
- * Herdado de v2.2:
- *   [P1] INTERACTIVE treina antes de marcar como queued
- *   [P2] CONSOLIDATION detecta estagnação → redireciona para EXPANSION
- *   [P4] /generate usa threshold de confiança
- *   [FIX-1] Firebase: .set({...}, {merge: true})
- *   [FIX-2] Rotação SYNTHETIC/CONSOLIDATION/EXPANSION/SELF_PLAY
- *   [FIX-3] Injeção de dados conversacionais sintéticos
- *
- * Parâmetros do modelo:
- *   embDim=128, hiddenSize=256, maxSeqLen=64  (~1.95M params)
+ * [PATCH] normalizedPrompt: remove \n entre u: e a: antes de gerar
  */
 
 require('dotenv').config();
@@ -46,13 +28,7 @@ const {
 } = require('./akie_behavior');
 
 const { generateSyntheticConversations }  = require('./_akie_synthetic');
-
-// [FIX-EXPANSION] Importar o novo data engine focado em Tatoeba/Conversacional
 const { runDataIngestion }                = require('./_akie_ingest');
-
-// ---------------------------------------------------------------------------
-// Configuração
-// ---------------------------------------------------------------------------
 
 const CONFIG = {
   intervalMs: 60_000,
@@ -60,7 +36,7 @@ const CONFIG = {
   httpPort:   parseInt(process.env.PORT || '3000', 10),
   saveEveryN: 5,
   generationLimits: {
-    social:  { maxTokens: 40,  temperature: 0.5 }, // [FIX-QUALITY] menos tokens, temperatura menor → menos lixo
+    social:  { maxTokens: 40,  temperature: 0.5 },
     analyze: { maxTokens: 200, temperature: 0.5 },
     code:    { maxTokens: 600, temperature: 0.3 },
     refino:  { maxTokens: 120, temperature: 0.4 },
@@ -86,10 +62,6 @@ const MODE = {
   SYNTHETIC:      'SYNTHETIC',
   SELF_PLAY:      'SELF_PLAY',
 };
-
-// ---------------------------------------------------------------------------
-// Estado global
-// ---------------------------------------------------------------------------
 
 const state = {
   cycle:                0,
@@ -120,40 +92,26 @@ const state = {
   },
 };
 
-// ---------------------------------------------------------------------------
-// Mutexes
-// ---------------------------------------------------------------------------
-
 let _trainLock = false;
 let _saveLock  = false;
-
-// ---------------------------------------------------------------------------
-// [FIX-QUALITY] Limpeza de saída neural
-// Remove artefatos comuns de um modelo em fase inicial de treino:
-//   <UNK>, prefixos "u:" / "a:", tokens repetidos em loop, pontuação solta
-// Retorna null se o resultado limpo for incoerente (< 3 palavras reais)
-// ---------------------------------------------------------------------------
 
 function cleanGeneratedText(raw) {
   if (!raw || typeof raw !== 'string') return null;
 
   let text = raw
-    .replace(/<UNK>/gi, '')           // tokens desconhecidos
-    .replace(/\bu\s*:\s*/gi, '')       // prefixo "u:" que vaza do prompt
-    .replace(/\ba\s*:\s*/gi, '')       // prefixo "a:" que vaza do prompt
-    .replace(/\s([?.!,;:])/g, '$1')    // espaço antes de pontuação
-    .replace(/([?.!])\s*\1+/g, '$1')   // pontuação duplicada
+    .replace(/<UNK>/gi, '')
+    .replace(/\bu\s*:\s*/gi, '')
+    .replace(/\ba\s*:\s*/gi, '')
+    .replace(/\s([?.!,;:])/g, '$1')
+    .replace(/([?.!])\s*\1+/g, '$1')
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Remover repetição de tokens: "contexto contexto contexto" → "contexto"
   text = text.replace(/\b(\w+)(\s+\1){2,}/gi, '$1');
 
-  // Remover se sobraram só pontuações ou tokens muito curtos
   const words = text.split(/\s+/).filter(w => w.length > 1 && /[a-záéíóúãõâêô]/i.test(w));
   if (words.length < 2) return null;
 
-  // Capitalizar primeira letra
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
@@ -175,10 +133,6 @@ async function safeSave() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Servidor HTTP
-// ---------------------------------------------------------------------------
-
 function startHttpServer() {
   const server = http.createServer(async (req, res) => {
     const headers = {
@@ -194,7 +148,6 @@ function startHttpServer() {
       return;
     }
 
-    // ── GET /status ────────────────────────────────────────────
     if (req.method === 'GET' && req.url === '/status') {
       const stats = state.model ? state.model.getStats() : { ready: false };
       res.writeHead(200, headers);
@@ -211,7 +164,6 @@ function startHttpServer() {
       return;
     }
 
-    // ── POST /generate ─────────────────────────────────────────
     if (req.method === 'POST' && req.url === '/generate') {
       let body = '';
       req.on('data', chunk => { body += chunk; });
@@ -251,7 +203,6 @@ function startHttpServer() {
 
           console.log(`[GENERATE] Modo: ${behavior.mode} | Confidence: ${(behavior.confidence || 0).toFixed(2)} | Input: "${prompt.substring(0, 80)}${prompt.length > 80 ? '...' : ''}"`);
 
-          // [FIX-NEURAL-PRACTICE] social sempre vai para neural — behavior_direct só para outros modos
           const useDirectOutput = behavior.output &&
             behavior.mode !== 'social' &&
             (behavior.confidence || 0) >= CONFIG.behaviorDirectConfidenceThreshold;
@@ -275,12 +226,12 @@ function startHttpServer() {
           const genMaxTokens = max_tokens  || modeLimits.maxTokens;
           const genTemp      = temperature || modeLimits.temperature;
 
-          const rawGenerated = await state.model.generate(prompt, genMaxTokens, genTemp);
+          // [PATCH v2.3.1] Normalizar \n entre u: e a: — evita token UNK no separador
+          const normalizedPrompt = prompt.replace(/\n\s*/g, ' ').trim();
+          const rawGenerated = await state.model.generate(normalizedPrompt, genMaxTokens, genTemp);
 
-          // [FIX-QUALITY] Limpar saída neural: remover <UNK>, artefatos de formato, repetições
           const cleanGenerated = cleanGeneratedText(rawGenerated);
 
-          // [FIX-ALWAYS-RESPOND] Nunca retornar 503 — fallback garante resposta sempre
           if (!cleanGenerated) {
             const fallbackText = behavior.output || 'Ainda estou aprendendo. Pode reformular?';
             state.generationStats.direct = (state.generationStats.direct || 0) + 1;
@@ -333,10 +284,6 @@ function startHttpServer() {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Inicialização
-// ---------------------------------------------------------------------------
-
 async function init() {
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -361,7 +308,6 @@ async function init() {
     state.model.ready = true;
   }
 
-  // [FIX-TIMEOUT] Evita double-build: marca como carregado logo após init
   state.modelLoadedFromBinary = true;
 
   console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'}`);
@@ -437,10 +383,6 @@ async function tryLoadModelFromBinary() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Scheduler principal
-// ---------------------------------------------------------------------------
-
 let schedulerRunning = false;
 
 async function scheduler() {
@@ -504,10 +446,6 @@ async function scheduler() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Executor de modo
-// ---------------------------------------------------------------------------
-
 async function runMode(mode, ctx = {}) {
   if (_trainLock) {
     const tag = ctx.tag || '';
@@ -524,7 +462,6 @@ async function runMode(mode, ctx = {}) {
 
   switch (mode) {
 
-    // ── INTERACTIVE ──────────────────────────────────────────────────────────
     case MODE.INTERACTIVE: {
       await maybeExpandVocab(episodes);
 
@@ -562,7 +499,6 @@ async function runMode(mode, ctx = {}) {
       const accStr  = isFiniteNum(normAcc)  ? (normAcc * 100).toFixed(1) + '%' : 'n/a';
       console.log(`${tag} ✓ ${desc} | loss=${lossStr} acc=${accStr} | ${elapsed}s`);
 
-      // [FIX-EPISODES] Marcar como queued APÓS treino bem-sucedido
       await markEpisodesAsQueued(episodes);
 
       if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
@@ -574,7 +510,6 @@ async function runMode(mode, ctx = {}) {
       return;
     }
 
-    // ── CONSOLIDATION ─────────────────────────────────────────────────────────
     case MODE.CONSOLIDATION: {
       const sentences = await fetchGraphSentences(state.db, 300);
       if (!sentences.length) {
@@ -586,7 +521,6 @@ async function runMode(mode, ctx = {}) {
       break;
     }
 
-    // ── EXPANSION — agora usa runDataIngestion (Tatoeba + Conversacional) ─────
     case MODE.EXPANSION: {
       const vocabBefore = state.vocab.size;
 
@@ -597,7 +531,6 @@ async function runMode(mode, ctx = {}) {
       pairs = ingestResult.pairs;
       desc  = `ingest (${ingestResult.sentences} frases) → ${pairs.length} pares`;
 
-      // Salvar vocab se cresceu
       if (state.vocab.size > vocabBefore) {
         await saveVocab(state.vocab);
         await maybeRebuildForVocabGrowth();
@@ -605,7 +538,6 @@ async function runMode(mode, ctx = {}) {
       break;
     }
 
-    // ── SYNTHETIC ─────────────────────────────────────────────────────────────
     case MODE.SYNTHETIC: {
       const syntheticPairs = await generateSyntheticConversations(state.vocab, 200);
       pairs = syntheticPairs;
@@ -613,7 +545,6 @@ async function runMode(mode, ctx = {}) {
       break;
     }
 
-    // ── SELF_PLAY ─────────────────────────────────────────────────────────────
     case MODE.SELF_PLAY: {
       pairs = await selfPlayPairs(state.model, state.db, state.vocab, 15);
       desc  = `self-play → ${pairs.length} pares`;
@@ -621,7 +552,6 @@ async function runMode(mode, ctx = {}) {
     }
   }
 
-  // ── Treino comum (todos os modos exceto INTERACTIVE) ─────────────────────
   if (pairs.length > 0) {
     shuffleArray(pairs);
 
@@ -643,7 +573,6 @@ async function runMode(mode, ctx = {}) {
     state.metrics.trainCycles++;
     state.totalPairsTrained += pairs.length;
 
-    // [P2] Rastrear estagnação de loss na CONSOLIDATION
     if (mode === MODE.CONSOLIDATION && isFiniteNum(normLoss)) {
       const prevLoss = state.metrics.consolidationLastLoss;
       if (prevLoss !== null && prevLoss !== undefined) {
@@ -676,10 +605,6 @@ async function runMode(mode, ctx = {}) {
   if (state.modeHistory.length > 20) state.modeHistory.shift();
 }
 
-// ---------------------------------------------------------------------------
-// Helper: extrai loss/accuracy normalizados do resultado do trainBatch
-// ---------------------------------------------------------------------------
-
 function extractMetrics(result) {
   const safeResult = result || { loss: null, accuracy: null };
   const rawLoss    = safeResult.loss;
@@ -692,10 +617,6 @@ function extractMetrics(result) {
     : rawAcc;
   return { normLoss, normAcc };
 }
-
-// ---------------------------------------------------------------------------
-// Utilidades de vocab e persistência
-// ---------------------------------------------------------------------------
 
 async function maybeExpandVocab(episodes) {
   const before = state.vocab.size;
@@ -719,15 +640,6 @@ async function maybeRebuildForVocabGrowth() {
   }
 }
 
-/**
- * [FIX-EPISODES] markEpisodesAsQueued — versão defensiva
- *
- * Problema anterior: .update() lançava "NOT_FOUND" para documentos que
- * ainda não existiam no Firestore (primeiro episódio de um usuário).
- *
- * Solução: .set({...}, { merge: true }) cria o documento se não existir
- * e mescla campos se já existir — sem lançar exceção.
- */
 async function markEpisodesAsQueued(episodes) {
   if (!state.db || !episodes.length) return;
   try {
@@ -736,10 +648,7 @@ async function markEpisodesAsQueued(episodes) {
 
     for (const ep of episodes) {
       if (!ep.id) continue;
-
       const ref = state.db.collection('user_episodes').doc(ep.id);
-
-      // [FIX] set com merge=true: cria doc se não existir, nunca lança NOT_FOUND
       batch.set(ref, {
         queued_for_consolidation: true,
         queued_at:                now,
@@ -750,7 +659,6 @@ async function markEpisodesAsQueued(episodes) {
     await batch.commit();
     console.log(`[EPISODES] Marcados ${episodes.length} episódios como treinados`);
   } catch (err) {
-    // Erro não é fatal — apenas logar e continuar
     console.error('[EPISODES] Erro ao marcar episódios (não fatal):', err.message);
   }
 }
@@ -804,14 +712,10 @@ async function reportStatus(mode) {
       metrics:          state.metrics,
       model_stats:      state.model.getStats(),
       generation_stats: state.generationStats,
-      model_version:    '2.3',
+      model_version:    '2.3.1',
     }, { merge: true });
   } catch (e) { /* não crítico */ }
 }
-
-// ---------------------------------------------------------------------------
-// Utilitários
-// ---------------------------------------------------------------------------
 
 function shuffleArray(arr) {
   for (let i = arr.length - 1; i > 0; i--) {
@@ -819,10 +723,6 @@ function shuffleArray(arr) {
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
 }
-
-// ---------------------------------------------------------------------------
-// Watchdog
-// ---------------------------------------------------------------------------
 
 let lastHeartbeat = Date.now();
 
@@ -835,10 +735,6 @@ function startWatchdog() {
     }
   }, 30_000);
 }
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 
 async function main() {
   await init();
