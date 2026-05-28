@@ -1,5 +1,10 @@
 /**
- * worker.js v2.0  —  AKIE Training Worker + HTTP Endpoint
+ * worker.js v2.1  —  AKIE Training Worker + HTTP Endpoint
+ *
+ * CORREÇÃO v2.1:
+ *   [FIX-1] Firebase: .set({...}, {merge: true}) em vez de .update()
+ *   [FIX-2] Scheduler: EXPANSION a cada 3 ciclos + novo modo SYNTHETIC
+ *   [FIX-3] Injeção de dados conversacionais para destravar aprendizado
  *
  * UPGRADE MODERADO:
  *   embDim: 64 → 128
@@ -14,13 +19,9 @@
  *  │  MODO 1 — INTERACTIVE  (usuário interagiu)                  │
  *  │  MODO 2 — CONSOLIDATION (replay do grafo semântico)         │
  *  │  MODO 3 — EXPANSION    (web crawl, lacunas do grafo)        │
- *  │  MODO 4 — SELF_PLAY    (modelo gera e treina nos melhores)  │
+ *  │  MODO 4 — SYNTHETIC    (injeção de dados conversacionais)   │
+ *  │  MODO 5 — SELF_PLAY    (modelo gera e treina nos melhores)  │
  *  └─────────────────────────────────────────────────────────────┘
- *
- *  UPGRADE v2.0:
- *    - Detecção automática de incompatibilidade de modelo
- *    - Reset forçado com nova arquitetura se dimensões não casarem
- *    - Versionamento explícito em akie_meta.json
  */
 
 require('dotenv').config();
@@ -47,6 +48,9 @@ const {
   getDefaultContext,
 } = require('./akie_behavior');
 
+// [FIX-2] Novo módulo de geração sintética
+const { generateSyntheticConversations } = require('./_akie_synthetic');
+
 // ---------------------------------------------------------------------------
 // Configuração com suporte a upgrade
 // ---------------------------------------------------------------------------
@@ -57,14 +61,15 @@ const CONFIG = {
   httpPort: parseInt(process.env.PORT || '3000', 10),
   saveEveryN: 5,
   consolidationAfter: 1,
-  expansionAfter: 3,
+  expansionAfter: 2,  // [FIX-2] reduzido de 3 para forçar EXPANSION a cada 3 ciclos
+  syntheticAfter: 1,  // [FIX-2] novo: injetar dados sintéticos frequentemente
   selfPlayAfter: 2,
   // Upgrade v2.0: novos limites refletindo maior capacidade
   generationLimits: {
-    social: { maxTokens: 80, temperature: 0.7 },      // ↑ 60 → 80
-    analyze: { maxTokens: 200, temperature: 0.5 },    // ↑ 150 → 200
-    code: { maxTokens: 600, temperature: 0.3 },       // ↑ 500 → 600
-    refino: { maxTokens: 120, temperature: 0.4 },     // ↑ 100 → 120
+    social: { maxTokens: 80, temperature: 0.7 },
+    analyze: { maxTokens: 200, temperature: 0.5 },
+    code: { maxTokens: 600, temperature: 0.3 },
+    refino: { maxTokens: 120, temperature: 0.4 },
   },
   // Hiperparâmetros do modelo v2.0
   hparams: {
@@ -80,6 +85,7 @@ const MODE = {
   INTERACTIVE: 'INTERACTIVE',
   CONSOLIDATION: 'CONSOLIDATION',
   EXPANSION: 'EXPANSION',
+  SYNTHETIC: 'SYNTHETIC',      // [FIX-2] novo modo
   SELF_PLAY: 'SELF_PLAY',
 };
 
@@ -97,7 +103,7 @@ const state = {
   db: null,
   modeHistory: [],
   modelLoadedFromBinary: false,
-  modelIncompatible: false,  // ← FLAG: detectou incompatibilidade
+  modelIncompatible: false,
   metrics: {
     lastLoss: null,
     lastAccuracy: null,
@@ -168,7 +174,7 @@ function startHttpServer() {
         model: stats,
         mode_history: state.modeHistory.slice(-5),
         generation_stats: state.generationStats,
-        model_incompatible: state.modelIncompatible,  // ← novo
+        model_incompatible: state.modelIncompatible,
       }));
       return;
     }
@@ -312,13 +318,11 @@ async function init() {
   console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'}`);
 
   // Seed conversacional — roda sempre que o grafo estiver pequeno (< 50 nós)
-  // Isso cobre resets por upgrade sem depender da flag do Firestore
   if (state.db) {
     try {
       const graphSnap = await state.db.collection('nexus_graph').limit(50).get();
       if (graphSnap.size < 50) {
         console.log(`[INIT] Grafo pequeno (${graphSnap.size} nós) — forçando seed conversacional...`);
-        // Apaga flag para permitir reexecução
         await state.db.collection('akie_worker_status').doc('seed_conversacional').delete().catch(() => {});
         await runConversationalSeed(state.db);
       }
@@ -359,7 +363,6 @@ async function tryLoadModelFromBinary() {
       console.warn('║  → Removendo modelo antigo e inicializando novo...              ║');
       console.warn('╚══════════════════════════════════════════════════════════════╝\n');
 
-      // Backup do antigo
       const bakPath = `${CONFIG.modelDir}_v1_backup`;
       if (fs.existsSync(CONFIG.modelDir)) {
         try {
@@ -424,17 +427,17 @@ async function scheduler() {
     if (episodes.length > 0) {
       mode = MODE.INTERACTIVE;
     } else {
-      // Rotação explícita a cada 6 ciclos idle:
-      //   slots 1,2,3,6 → CONSOLIDATION
-      //   slot  4       → EXPANSION
-      //   slot  5       → SELF_PLAY (só se já treinou algo)
-      const slot = ((state.idleCycles - 1) % 6) + 1;
-      if (slot === 4) {
-        mode = MODE.EXPANSION;
-      } else if (slot === 5 && state.model.trainSteps > 50) {
-        mode = MODE.SELF_PLAY;
-      } else {
-        mode = MODE.CONSOLIDATION;
+      // [FIX-2] Rotação compactada para destravar aprendizado:
+      //   padrão de 4 ciclos: SYNTHETIC, CONSOLIDATION, EXPANSION, SELF_PLAY
+      const slot = (state.idleCycles % 4);
+      if (slot === 0) {
+        mode = MODE.SYNTHETIC;        // Injeta dados conversacionais novos
+      } else if (slot === 1) {
+        mode = MODE.CONSOLIDATION;    // Aprende sobre grafo existente
+      } else if (slot === 2) {
+        mode = MODE.EXPANSION;        // Web crawl + novos padrões
+      } else if (slot === 3) {
+        mode = MODE.SELF_PLAY;        // Auto-geração (se houver treino anterior)
       }
     }
 
@@ -478,7 +481,7 @@ async function runMode(mode, ctx = {}) {
   switch (mode) {
     case MODE.INTERACTIVE: {
       await maybeExpandVocab(episodes);
-      await markEpisodesAsQueued(episodes);
+      await markEpisodesAsQueued(episodes);  // [FIX-1] agora sem NOT_FOUND
       console.log(`${tag} INTERACTIVE: ${episodes.length} episódios enfileirados`);
       state.modeHistory.push(mode);
       if (state.modeHistory.length > 20) state.modeHistory.shift();
@@ -504,6 +507,13 @@ async function runMode(mode, ctx = {}) {
       }
       break;
     }
+    // [FIX-2] Novo modo SYNTHETIC para injetar dados conversacionais
+    case MODE.SYNTHETIC: {
+      const syntheticPairs = await generateSyntheticConversations(state.vocab, 200);
+      pairs = syntheticPairs;
+      desc = `synthetic conversacional → ${pairs.length} pares`;
+      break;
+    }
     case MODE.SELF_PLAY: {
       pairs = await selfPlayPairs(state.model, state.db, state.vocab, 15);
       desc = `self-play → ${pairs.length} pares`;
@@ -524,10 +534,8 @@ async function runMode(mode, ctx = {}) {
       _trainLock = false;
     }
 
-    // result pode ser undefined se trainBatch lançou exceção
     const safeResult = result || { loss: null, accuracy: null };
 
-    // Normaliza loss: extrai valor numérico de Tensor se necessário, rejeita NaN/Infinity
     const rawLoss = safeResult.loss;
     const rawAcc  = safeResult.accuracy;
     const normLoss = (rawLoss != null && typeof rawLoss.dataSync === 'function')
@@ -585,21 +593,28 @@ async function maybeRebuildForVocabGrowth() {
   }
 }
 
+// [FIX-1] CORREÇÃO CRÍTICA: use .set com merge em vez de .update
 async function markEpisodesAsQueued(episodes) {
   if (!state.db || !episodes.length) return;
   try {
     const batch = state.db.batch();
     for (const ep of episodes) {
       if (ep.id) {
-        batch.update(state.db.collection('user_episodes').doc(ep.id), {
-          queued_for_consolidation: true,
-          queued_at: new Date().toISOString(),
-        });
+        // Usar .set({...}, {merge: true}) para criar se não existir
+        batch.set(
+          state.db.collection('user_episodes').doc(ep.id),
+          {
+            queued_for_consolidation: true,
+            queued_at: new Date().toISOString(),
+          },
+          { merge: true }
+        );
       }
     }
     await batch.commit();
+    console.log(`[EPISODES] Marcados ${episodes.length} episódios para consolidação`);
   } catch (err) {
-    console.error('[VOCAB] Erro ao marcar episódios:', err.message);
+    console.error('[EPISODES] Erro ao marcar episódios:', err.message);
   }
 }
 
@@ -626,7 +641,7 @@ async function saveVocab(vocab) {
   } catch (e) {
     try {
       if (state.db) {
-        await state.db.collection('akie_worker_status').doc('vocabulary').set(vocab.toJSON());
+        await state.db.collection('akie_worker_status').doc('vocabulary').set(vocab.toJSON(), { merge: true });
       }
     } catch (e2) {
       console.error('[VOCAB] Falha ao salvar:', e2.message);
@@ -648,7 +663,7 @@ async function reportStatus(mode) {
       metrics: state.metrics,
       model_stats: state.model.getStats(),
       generation_stats: state.generationStats,
-      model_version: '2.0',  // ← versão atual
+      model_version: '2.1',  // [FIX] versão corrigida
     }, { merge: true });
   } catch (e) { /* não crítico */ }
 }
@@ -711,10 +726,10 @@ async function main() {
 
     try {
       if (state.db) {
-        await state.db.collection('akie_worker_status').doc('current').update({
+        await state.db.collection('akie_worker_status').doc('current').set({
           status: 'stopped',
           stopped_at: new Date().toISOString(),
-        });
+        }, { merge: true });
       }
     } catch { /* ignora */ }
 
