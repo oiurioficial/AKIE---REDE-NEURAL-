@@ -495,18 +495,34 @@ async function runMode(mode, ctx = {}) {
     let result;
     try {
       result = await state.model.trainBatch(pairs, 3);
+    } catch (trainErr) {
+      console.error(`${tag} Erro durante trainBatch:`, trainErr.message);
     } finally {
       _trainLock = false;
     }
 
-    state.metrics.lastLoss = result.loss;
-    state.metrics.lastAccuracy = result.accuracy;
+    // result pode ser undefined se trainBatch lançou exceção
+    const safeResult = result || { loss: null, accuracy: null };
+
+    // Normaliza loss: extrai valor numérico de Tensor se necessário, rejeita NaN/Infinity
+    const rawLoss = safeResult.loss;
+    const rawAcc  = safeResult.accuracy;
+    const normLoss = (rawLoss != null && typeof rawLoss.dataSync === 'function')
+      ? rawLoss.dataSync()[0]
+      : rawLoss;
+    const normAcc  = (rawAcc != null && typeof rawAcc.dataSync === 'function')
+      ? rawAcc.dataSync()[0]
+      : rawAcc;
+    const isFiniteNum = v => typeof v === 'number' && isFinite(v) && !isNaN(v);
+
+    state.metrics.lastLoss     = isFiniteNum(normLoss) ? normLoss : state.metrics.lastLoss;
+    state.metrics.lastAccuracy = isFiniteNum(normAcc)  ? normAcc  : state.metrics.lastAccuracy;
     state.metrics.trainCycles++;
     state.totalPairsTrained += pairs.length;
 
     const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-    const loss = result.loss != null ? result.loss.toFixed(4) : 'n/a';
-    const acc = result.accuracy != null ? (result.accuracy * 100).toFixed(1) + '%' : 'n/a';
+    const loss = isFiniteNum(normLoss) ? normLoss.toFixed(4) : 'n/a';
+    const acc  = isFiniteNum(normAcc)  ? (normAcc * 100).toFixed(1) + '%' : 'n/a';
     console.log(`${tag} ✓ ${desc} | loss=${loss} acc=${acc} | ${elapsed}s`);
 
     if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
