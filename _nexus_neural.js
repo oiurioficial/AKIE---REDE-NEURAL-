@@ -726,6 +726,19 @@ class AKIEModel {
     console.log('[AKIE] ✓ Expansão de vocab concluída.');
   }
 
+  setLearningRate(lr) {
+    if (!this.ready || !lr || lr <= 0) return;
+    // tf.train.adam não expõe setter direto — recria o otimizador e recompila.
+    // Operação leve: não afeta pesos, apenas o estado momentos do otimizador.
+    this.hparams.learningRate = lr;
+    this.optimizer = tf.train.adam(lr);
+    this.model.compile({
+      optimizer: this.optimizer,
+      loss: 'sparseCategoricalCrossentropy',
+      metrics: ['accuracy'],
+    });
+  }
+
   getStats() {
     return {
       architecture:       'Causal Transformer Decoder v2.0',
