@@ -49,6 +49,14 @@ const CONFIG = {
     batchSize:    4,
     learningRate: 0.0005,
   },
+  // LR diferenciado por modo — INTERACTIVE usa 10x menos para evitar catastrofic forgetting
+  learningRates: {
+    INTERACTIVE:   0.00005,
+    CONSOLIDATION: 0.0003,
+    EXPANSION:     0.0003,
+    SYNTHETIC:     0.0005,
+    SELF_PLAY:     0.0002,
+  },
   consolidation: {
     stagnationDelta:  0.005,
     stagnationCycles: 3,
@@ -529,6 +537,7 @@ async function runMode(mode, ctx = {}) {
       _trainLock = true;
       let result;
       try {
+        state.model.setLearningRate(CONFIG.learningRates.INTERACTIVE);
         result = await state.model.trainBatch(pairs, 3);
       } catch (trainErr) {
         console.error(`${tag} Erro durante trainBatch (INTERACTIVE):`, trainErr.message);
@@ -569,7 +578,13 @@ async function runMode(mode, ctx = {}) {
         return;
       }
       pairs = graphSentencesToPairs(sentences, state.vocab);
-      desc  = `${sentences.length} frases do grafo → ${pairs.length} pares`;
+      // Cap: máx 2000 pares por ciclo — evita ciclos de 25min que bloqueiam o scheduler
+      if (pairs.length > 2000) {
+        shuffleArray(pairs);
+        pairs = pairs.slice(0, 2000);
+        console.log(`${tag} [CONSOLIDATION] Pares limitados a 2000 (era ${pairs.length + 2000 - pairs.length})`);
+      }
+      desc  = `${sentences.length} frases do grafo → ${pairs.length} pares (cap=2000)`;
       break;
     }
 
@@ -610,6 +625,8 @@ async function runMode(mode, ctx = {}) {
     _trainLock = true;
     let result;
     try {
+      const lr = CONFIG.learningRates[mode] || CONFIG.hparams.learningRate;
+      state.model.setLearningRate(lr);
       result = await state.model.trainBatch(pairs, 3);
     } catch (trainErr) {
       console.error(`${tag} Erro durante trainBatch:`, trainErr.message);
