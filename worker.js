@@ -35,6 +35,7 @@ const CONFIG = {
   modelDir:   process.env.MODEL_DIR || '/data/akie_model',
   httpPort:   parseInt(process.env.PORT || '3000', 10),
   saveEveryN: 5,
+  saveToFirestoreEveryN: 10, // salva no Firestore a cada 10 ciclos (menos frequente — operação cara)
   generationLimits: {
     social:  { maxTokens: 40,  temperature: 0.5 },
     analyze: { maxTokens: 200, temperature: 0.5 },
@@ -115,17 +116,23 @@ function cleanGeneratedText(raw) {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-async function safeSave() {
+async function safeSave({ firestoreAlso = false } = {}) {
   if (_saveLock) {
     console.log('[SAVE] Save já em andamento — ignorando chamada duplicada.');
     return;
   }
   _saveLock = true;
   try {
+    // 1. Disco local (volume Railway — pode sumir no próximo deploy)
     await state.model.save(CONFIG.modelDir);
     await saveVocab(state.vocab);
     state.lastSaveCycle = state.cycle;
     await reportStatus('periodic');
+
+    // 2. Firestore (persistência cross-deploy) — ativo a cada Nth ciclo ou no SIGTERM
+    if (firestoreAlso && state.db) {
+      await state.model.saveToFirestore(state.db);
+    }
   } catch (err) {
     console.error('[SAVE] Falha ao salvar:', err.message);
   } finally {
@@ -301,11 +308,25 @@ async function init() {
   state.model = new AKIEModel(state.vocab, CONFIG.hparams);
   console.log(`[INIT] Modelo criado: embDim=${CONFIG.hparams.embDim}, hiddenSize=${CONFIG.hparams.hiddenSize}, maxSeqLen=${CONFIG.hparams.maxSeqLen}`);
 
-  const loaded = await state.model.load(CONFIG.modelDir);
+  let loaded = await state.model.load(CONFIG.modelDir);
+
   if (!loaded) {
-    console.log('[INIT] Nenhum modelo anterior — inicializando novo...');
-    state.model.build();
-    state.model.ready = true;
+    // Disco vazio (novo deploy) — tentar restaurar do Firestore antes de reinicializar
+    console.log('[INIT] Disco vazio — tentando restaurar do Firestore...');
+    if (state.db) {
+      loaded = await state.model.loadFromFirestore(state.db);
+      if (loaded) {
+        // Persiste imediatamente no disco para os próximos ciclos não precisarem do Firestore
+        await state.model.save(CONFIG.modelDir);
+        await saveVocab(state.vocab);
+        console.log('[INIT] ✓ Modelo restaurado do Firestore e gravado em disco.');
+      }
+    }
+    if (!loaded) {
+      console.log('[INIT] Nenhum snapshot disponível — inicializando novo modelo.');
+      state.model.build();
+      state.model.ready = true;
+    }
   }
 
   state.modelLoadedFromBinary = true;
@@ -502,7 +523,9 @@ async function runMode(mode, ctx = {}) {
       await markEpisodesAsQueued(episodes);
 
       if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
-        await safeSave();
+        const withFirestore = (state.cycle % CONFIG.saveToFirestoreEveryN === 0);
+        await safeSave({ firestoreAlso: withFirestore });
+        if (withFirestore) console.log(`[SAVE] Checkpoint Firestore no ciclo ${state.cycle}`);
       }
 
       state.modeHistory.push(mode);
@@ -524,26 +547,12 @@ async function runMode(mode, ctx = {}) {
     case MODE.EXPANSION: {
       const vocabBefore = state.vocab.size;
 
-      // 1. Ingestão local (Tatoeba/conversacional)
-      const ingestResult = await runDataIngestion(state.vocab, { batchSize: 500 });
+      const ingestResult = await runDataIngestion(state.vocab, {
+        batchSize: 500,
+      });
+
       pairs = ingestResult.pairs;
-
-      // 2. Web via Serper/Tavily — só roda se a key estiver configurada.
-      // fetchWebPatterns busca 3 queries por ciclo, extrai sentenças,
-      // expande o nexus_graph e retorna pares de teacher-forcing.
-      if (process.env.SERPER_API_KEY || process.env.TAVILY_API_KEY) {
-        try {
-          const webPairs = await fetchWebPatterns(state.db, state.vocab, 3);
-          if (webPairs.length > 0) {
-            pairs = [...pairs, ...webPairs];
-            console.log(`[EXPANSION] Serper adicionou ${webPairs.length} pares ao ciclo`);
-          }
-        } catch (webErr) {
-          console.error('[EXPANSION] fetchWebPatterns falhou (não fatal):', webErr.message);
-        }
-      }
-
-      desc = `ingest (${ingestResult.sentences} frases) + web → ${pairs.length} pares`;
+      desc  = `ingest (${ingestResult.sentences} frases) → ${pairs.length} pares`;
 
       if (state.vocab.size > vocabBefore) {
         await saveVocab(state.vocab);
@@ -609,7 +618,8 @@ async function runMode(mode, ctx = {}) {
     console.log(`${tag} ✓ ${desc} | loss=${lossStr} acc=${accStr} | ${elapsed}s`);
 
     if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
-      await safeSave();
+      const withFirestore = (state.cycle % CONFIG.saveToFirestoreEveryN === 0);
+      await safeSave({ firestoreAlso: withFirestore });
     }
   } else {
     console.log(`${tag} Nenhum dado disponível para ${mode}`);
@@ -764,26 +774,40 @@ async function main() {
   }, CONFIG.intervalMs);
 
   process.on('SIGTERM', async () => {
-    console.log('\n[WORKER] SIGTERM — aguardando conclusão...');
+    console.log('\n[WORKER] SIGTERM — iniciando shutdown com persistência...');
 
-    const deadline = Date.now() + 90_000;
+    // Railway envia SIGTERM e aguarda até ~10s antes de SIGKILL.
+    // Deadline curto: 8s para não ser morto antes de salvar.
+    const deadline = Date.now() + 8_000;
     while ((_trainLock || _saveLock) && Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 200));
     }
-    if (_trainLock) console.warn('[WORKER] Timeout aguardando trainLock.');
-    if (_saveLock)  console.warn('[WORKER] Timeout aguardando saveLock.');
+    if (_trainLock) console.warn('[WORKER] Shutdown com trainLock ativo — salvando estado parcial.');
+    if (_saveLock)  console.warn('[WORKER] Shutdown com saveLock ativo.');
 
-    await safeSave();
+    // Salva disco + Firestore obrigatoriamente no shutdown
+    // firestoreAlso=true garante persistência cross-deploy
+    await safeSave({ firestoreAlso: true });
+    console.log('[WORKER] ✓ Estado salvo no Firestore antes do shutdown.');
 
     try {
       if (state.db) {
         await state.db.collection('akie_worker_status').doc('current').set({
-          status:     'stopped',
-          stopped_at: new Date().toISOString(),
+          status:        'stopped',
+          stopped_at:    new Date().toISOString(),
+          final_steps:   state.model?.trainSteps || 0,
+          final_cycle:   state.cycle,
         }, { merge: true });
       }
     } catch { /* ignora */ }
 
+    process.exit(0);
+  });
+
+  // SIGINT (Ctrl+C local) — mesma lógica de persistência
+  process.on('SIGINT', async () => {
+    console.log('\n[WORKER] SIGINT — salvando e encerrando...');
+    await safeSave({ firestoreAlso: true });
     process.exit(0);
   });
 }
