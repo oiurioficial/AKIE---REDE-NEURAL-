@@ -131,7 +131,22 @@ async function safeSave({ firestoreAlso = false } = {}) {
 
     // 2. Firestore (persistência cross-deploy) — ativo a cada Nth ciclo ou no SIGTERM
     if (firestoreAlso && state.db) {
-      await state.model.saveToFirestore(state.db);
+      if (typeof state.model.saveToFirestore === 'function') {
+        await state.model.saveToFirestore(state.db);
+      } else {
+        // Fallback: persiste metadados e stats quando AKIEModel não implementa saveToFirestore
+        try {
+          const stats = state.model.getStats ? state.model.getStats() : {};
+          await state.db.collection('akie_worker_status').doc('model_checkpoint').set({
+            saved_at:    new Date().toISOString(),
+            cycle:       state.cycle,
+            train_steps: state.model.trainSteps || 0,
+            stats,
+          }, { merge: true });
+        } catch (fsErr) {
+          console.error('[SAVE] Falha no checkpoint Firestore (fallback):', fsErr.message);
+        }
+      }
     }
   } catch (err) {
     console.error('[SAVE] Falha ao salvar:', err.message);
@@ -152,6 +167,20 @@ function startHttpServer() {
     if (req.method === 'OPTIONS') {
       res.writeHead(204, headers);
       res.end();
+      return;
+    }
+
+    // ── Health-check raiz ─────────────────────────────────
+    if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
+      res.writeHead(200, headers);
+      res.end(JSON.stringify({
+        ok:      true,
+        service: 'AKIE Worker',
+        version: '2.3.1',
+        status:  state.model?.ready ? 'ready' : 'initializing',
+        cycle:   state.cycle,
+        steps:   state.model?.trainSteps || 0,
+      }));
       return;
     }
 
