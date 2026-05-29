@@ -83,7 +83,7 @@ const HPARAMS = {
   maxGenTokens:       40,
   minNewData:          3,
   beamSize:            3,
-  repetitionPenalty: 2.5,
+  repetitionPenalty: 1.2,
   modelVersion:     '2.0',
 };
 
@@ -427,88 +427,40 @@ class AKIEModel {
     temperature = temperature || this.hparams.temperature;
 
     const ids   = this.vocab.tokenize(prompt);
-    const beams = [{ ids: ids.slice(-this.hparams.maxSeqLen), logProb: 0, finished: false }];
-
-    // Extrai n-gramas (n=2 e n=3) de uma sequência de ids para penalidade de repetição estrutural.
-    // Retorna um Set de strings "id1,id2[,id3]" representando n-gramas já vistos.
-    const _buildNgramSet = (sequence, n) => {
-      const s = new Set();
-      for (let i = 0; i <= sequence.length - n; i++) {
-        s.add(sequence.slice(i, i + n).join(','));
-      }
-      return s;
-    };
+    const beams = [{ ids: ids.slice(-this.hparams.maxSeqLen), logProb: 0 }];
 
     for (let step = 0; step < maxTokens; step++) {
-      // Se todos os beams já terminaram em EOS, encerra cedo.
-      if (beams.every(b => b.finished)) break;
-
       const nextBeams = [];
 
       for (const beam of beams) {
-        // Beam finalizado — mantém sem expandir (preserva o melhor caminho encerrado)
-        if (beam.finished) {
-          nextBeams.push(beam);
-          continue;
-        }
-
         const padded = [
           ...Array(Math.max(0, this.hparams.maxSeqLen - beam.ids.length)).fill(SPECIAL.PAD),
           ...beam.ids,
         ].slice(-this.hparams.maxSeqLen);
 
-        const seqTensor  = tf.tensor2d([padded], [1, this.hparams.maxSeqLen], 'int32');
-        const logits     = this.model.predict(seqTensor);
+        const seqTensor = tf.tensor2d([padded], [1, this.hparams.maxSeqLen], 'int32');
+        const logits    = this.model.predict(seqTensor);
         const logitsData = logits.dataSync();
         seqTensor.dispose();
         logits.dispose();
 
-        // --- Penalidade de repetição unigrama (token já visto na sequência) ---
+        // Penalização de repetição
         const seenSet = new Set(beam.ids);
-
-        // --- Penalidade de repetição de n-gramas (anti-gagueijo bigram/trigram) ---
-        // Um token candidato 'i' fecha um bigrama se beam.ids[-1]+i já ocorreu.
-        // Fecha um trigrama se beam.ids[-2]+beam.ids[-1]+i já ocorreu.
-        const bigramSet  = _buildNgramSet(beam.ids, 2);
-        const trigramSet = _buildNgramSet(beam.ids, 3);
-        const lastId     = beam.ids.length > 0 ? beam.ids[beam.ids.length - 1] : -1;
-        const prevId     = beam.ids.length > 1 ? beam.ids[beam.ids.length - 2] : -1;
-
         const probs = Array.from(logitsData).map((l, i) => {
-          let adj = Math.max(l, 1e-10);
-
-          // Penalidade unigrama
-          if (seenSet.has(i)) {
-            adj = adj > 0
-              ? adj / this.hparams.repetitionPenalty
-              : adj * this.hparams.repetitionPenalty;
-          }
-
-          // Penalidade bigrama: se (lastId, i) já apareceu → penalidade extra 1.5x
-          if (lastId >= 0 && bigramSet.has(`${lastId},${i}`)) {
-            adj = adj / 1.5;
-          }
-
-          // Penalidade trigrama: se (prevId, lastId, i) já apareceu → bloqueia (prob ~0)
-          if (prevId >= 0 && lastId >= 0 && trigramSet.has(`${prevId},${lastId},${i}`)) {
-            adj = adj / 100;
-          }
-
+          let adj = l;
+          if (seenSet.has(i)) adj = adj > 0 ? adj / this.hparams.repetitionPenalty : adj * this.hparams.repetitionPenalty;
           return { id: i, logprob: Math.log(Math.max(1e-10, adj / temperature)) };
         });
 
         probs.sort((a, b) => b.logprob - a.logprob);
 
         for (let k = 0; k < this.hparams.beamSize && k < probs.length; k++) {
-          const nextId   = probs[k].id;
-          const finished = (nextId === SPECIAL.EOS);
+          const nextId = probs[k].id;
           nextBeams.push({
-            ids:      [...beam.ids, nextId],
-            logProb:  beam.logProb + probs[k].logprob,
-            finished,
+            ids:     [...beam.ids, nextId],
+            logProb: beam.logProb + probs[k].logprob,
           });
-          // EOS encontrado — este beam está completo; não expandir mais este ramo.
-          if (finished) break;
+          if (nextId === SPECIAL.EOS) break;
         }
       }
 
@@ -569,6 +521,159 @@ class AKIEModel {
     await fs.promises.rename(tmpDir, dir);
 
     console.log(`[AKIE] ✓ Modelo v2.0 salvo em ${dir} (steps: ${this.trainSteps})`);
+  }
+
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // saveToFirestore — persiste pesos como base64 no Firestore
+  // Firestore tem limite de 1MB por documento; pesos ~7.8MB (1.95M params × 4B).
+  // Estratégia: chunking em fatias de 700KB base64 → N documentos na subcoleção
+  // akie_model_chunks/{chunkIndex}, com manifesto em akie_worker_status/model_snapshot.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  async saveToFirestore(db) {
+    if (!this.ready || !db) return false;
+
+    const CHUNK_BYTES = 700_000; // ~700KB por documento — abaixo do limite de 1MB do Firestore
+
+    try {
+      console.log('[FIRESTORE-SAVE] Serializando pesos...');
+      const weights  = this.model.getWeights();
+      const manifest = weights.map(w => ({ name: w.name, shape: w.shape }));
+
+      // Montar buffer único com todos os pesos
+      const allData     = weights.map(w => w.dataSync());
+      const totalFloats = allData.reduce((sum, arr) => sum + arr.length, 0);
+      const buffer      = Buffer.allocUnsafe(totalFloats * 4);
+      let offset = 0;
+      for (const arr of allData) {
+        for (const v of arr) { buffer.writeFloatLE(v, offset); offset += 4; }
+      }
+
+      // Fatiar em chunks de 700KB
+      const b64     = buffer.toString('base64');
+      const chunks  = [];
+      for (let i = 0; i < b64.length; i += CHUNK_BYTES) {
+        chunks.push(b64.slice(i, i + CHUNK_BYTES));
+      }
+
+      console.log(`[FIRESTORE-SAVE] ${totalFloats} floats → ${buffer.length} bytes → ${chunks.length} chunks`);
+
+      // Salvar chunks em lotes (Firestore batch max 500 ops)
+      const chunkColl = db.collection('akie_model_chunks');
+      for (let i = 0; i < chunks.length; i++) {
+        await chunkColl.doc(String(i).padStart(4, '0')).set({
+          index: i,
+          data:  chunks[i],
+          total: chunks.length,
+          savedAt: new Date().toISOString(),
+        });
+      }
+
+      // Manifesto e metadados no documento principal
+      const vocabJSON = this.vocab.toJSON();
+      const meta = {
+        ok:                 true,
+        trainSteps:         this.trainSteps,
+        vocabSize:          this.vocab.size,
+        embeddingVocabSize: this.embeddingVocabSize,
+        hparams:            this.hparams,
+        savedAt:            new Date().toISOString(),
+        chunkCount:         chunks.length,
+        totalBytes:         buffer.length,
+        manifest:           JSON.stringify(manifest),
+        modelVersion:       this.hparams.modelVersion,
+      };
+
+      await db.collection('akie_worker_status').doc('model_snapshot').set(meta);
+
+      // Vocab separado (pode ser grande — salvo em doc próprio)
+      await db.collection('akie_worker_status').doc('vocabulary').set(vocabJSON, { merge: false });
+
+      console.log(`[FIRESTORE-SAVE] ✓ Modelo salvo no Firestore (${chunks.length} chunks, steps=${this.trainSteps})`);
+      return true;
+    } catch (err) {
+      console.error('[FIRESTORE-SAVE] Falha:', err.message);
+      return false;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // loadFromFirestore — restaura pesos do Firestore quando o disco está vazio
+  // ─────────────────────────────────────────────────────────────────────────
+
+  async loadFromFirestore(db) {
+    if (!db) return false;
+
+    try {
+      const snapDoc = await db.collection('akie_worker_status').doc('model_snapshot').get();
+      if (!snapDoc.exists || !snapDoc.data().ok) {
+        console.log('[FIRESTORE-LOAD] Sem snapshot no Firestore.');
+        return false;
+      }
+
+      const meta = snapDoc.data();
+      console.log(`[FIRESTORE-LOAD] Snapshot encontrado: steps=${meta.trainSteps}, chunks=${meta.chunkCount}, saved=${meta.savedAt}`);
+
+      // Validar compatibilidade de arquitetura antes de carregar
+      const savedHparams = meta.hparams || {};
+      if (
+        savedHparams.embDim     !== this.hparams.embDim    ||
+        savedHparams.hiddenSize !== this.hparams.hiddenSize ||
+        savedHparams.maxSeqLen  !== this.hparams.maxSeqLen
+      ) {
+        console.warn('[FIRESTORE-LOAD] Arquitetura incompatível — ignorando snapshot.');
+        return false;
+      }
+
+      // Ler todos os chunks em ordem
+      const chunkColl = db.collection('akie_model_chunks');
+      const b64Parts  = [];
+      for (let i = 0; i < meta.chunkCount; i++) {
+        const doc = await chunkColl.doc(String(i).padStart(4, '0')).get();
+        if (!doc.exists) throw new Error(`Chunk ${i} ausente`);
+        b64Parts.push(doc.data().data);
+      }
+
+      const buffer   = Buffer.from(b64Parts.join(''), 'base64');
+      const manifest = JSON.parse(meta.manifest);
+
+      // Reconstruir tensores
+      this.embeddingVocabSize = meta.embeddingVocabSize || meta.vocabSize || this.vocab.size;
+      const shellVocab = { ...this.vocab, size: this.embeddingVocabSize };
+      const shell = new AKIEModel(shellVocab, this.hparams);
+      shell.embeddingVocabSize = this.embeddingVocabSize;
+      shell.build();
+
+      let bufOffset = 0;
+      const tensors = manifest.map(w => {
+        const numFloats = w.shape.reduce((a, b) => a * b, 1);
+        const arr = new Float32Array(numFloats);
+        for (let i = 0; i < numFloats; i++) {
+          arr[i] = buffer.readFloatLE(bufOffset); bufOffset += 4;
+        }
+        return tf.tensor(arr, w.shape, 'float32');
+      });
+
+      shell.model.setWeights(tensors);
+      tensors.forEach(t => t.dispose());
+
+      this.model = shell.model;
+      this.optimizer = tf.train.adam(this.hparams.learningRate);
+      this.model.compile({
+        optimizer: this.optimizer,
+        loss: 'sparseCategoricalCrossentropy',
+        metrics: ['accuracy'],
+      });
+      this.trainSteps = meta.trainSteps || 0;
+      this.ready = true;
+
+      console.log(`[FIRESTORE-LOAD] ✓ Modelo restaurado do Firestore (steps=${this.trainSteps})`);
+      return true;
+    } catch (err) {
+      console.error('[FIRESTORE-LOAD] Falha ao restaurar:', err.message);
+      return false;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
