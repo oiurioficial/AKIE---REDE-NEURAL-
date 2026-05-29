@@ -79,7 +79,7 @@ const HPARAMS = {
   maxSeqLen:          64,   // comprimento máximo de contexto
   batchSize:           4,   // batches pequenos para RAM limitada no Railway
   learningRate:    0.0005,
-  temperature:       0.8,
+  temperature:       0.6,
   maxGenTokens:       40,
   minNewData:          3,
   beamSize:            3,
@@ -426,41 +426,78 @@ class AKIEModel {
     maxTokens   = maxTokens   || this.hparams.maxGenTokens;
     temperature = temperature || this.hparams.temperature;
 
-    const ids   = this.vocab.tokenize(prompt);
-    const beams = [{ ids: ids.slice(-this.hparams.maxSeqLen), logProb: 0 }];
+    // IDs do prompt — usados para suprimir eco do input na resposta
+    const promptIds    = this.vocab.tokenize(prompt);
+    const promptIdSet  = new Set(promptIds);
+    const beams        = [{ ids: promptIds.slice(-this.hparams.maxSeqLen), logProb: 0, genCount: 0, finished: false }];
+
+    // Constrói Set de n-gramas (n=2 ou n=3) para penalidade estrutural anti-loop
+    const _ngrams = (seq, n) => {
+      const s = new Set();
+      for (let i = 0; i <= seq.length - n; i++) s.add(seq.slice(i, i + n).join(','));
+      return s;
+    };
 
     for (let step = 0; step < maxTokens; step++) {
+      if (beams.every(b => b.finished)) break;
+
       const nextBeams = [];
 
       for (const beam of beams) {
+        if (beam.finished) { nextBeams.push(beam); continue; }
+
         const padded = [
           ...Array(Math.max(0, this.hparams.maxSeqLen - beam.ids.length)).fill(SPECIAL.PAD),
           ...beam.ids,
         ].slice(-this.hparams.maxSeqLen);
 
-        const seqTensor = tf.tensor2d([padded], [1, this.hparams.maxSeqLen], 'int32');
-        const logits    = this.model.predict(seqTensor);
+        const seqTensor  = tf.tensor2d([padded], [1, this.hparams.maxSeqLen], 'int32');
+        const logits     = this.model.predict(seqTensor);
         const logitsData = logits.dataSync();
         seqTensor.dispose();
         logits.dispose();
 
-        // Penalização de repetição
-        const seenSet = new Set(beam.ids);
+        // Tokens já gerados (excluindo o prompt original)
+        const genIds    = beam.ids.slice(promptIds.length);
+        const seenSet   = new Set(beam.ids);
+        const bigrams   = _ngrams(beam.ids, 2);
+        const trigrams  = _ngrams(beam.ids, 3);
+        const lastId    = beam.ids.length > 0 ? beam.ids[beam.ids.length - 1] : -1;
+        const prevId    = beam.ids.length > 1 ? beam.ids[beam.ids.length - 2] : -1;
+
         const probs = Array.from(logitsData).map((l, i) => {
-          let adj = l;
-          if (seenSet.has(i)) adj = adj > 0 ? adj / this.hparams.repetitionPenalty : adj * this.hparams.repetitionPenalty;
+          let adj = Math.max(l, 1e-10);
+
+          // 1. Suprimir tokens do prompt nos primeiros 6 tokens gerados
+          //    Evita o eco "Quem é você? que você" repetindo o input
+          if (beam.genCount < 6 && promptIdSet.has(i)) adj /= 4.0;
+
+          // 2. Penalidade unigrama (token já visto)
+          if (seenSet.has(i)) {
+            adj = adj > 0 ? adj / this.hparams.repetitionPenalty : adj * this.hparams.repetitionPenalty;
+          }
+
+          // 3. Penalidade bigrama (par recente já ocorreu)
+          if (lastId >= 0 && bigrams.has(`${lastId},${i}`)) adj /= 2.0;
+
+          // 4. Penalidade trigrama (triplete já ocorreu — bloqueio efetivo)
+          if (prevId >= 0 && lastId >= 0 && trigrams.has(`${prevId},${lastId},${i}`)) adj /= 80;
+
           return { id: i, logprob: Math.log(Math.max(1e-10, adj / temperature)) };
         });
 
         probs.sort((a, b) => b.logprob - a.logprob);
 
         for (let k = 0; k < this.hparams.beamSize && k < probs.length; k++) {
-          const nextId = probs[k].id;
+          const nextId   = probs[k].id;
+          const finished = (nextId === SPECIAL.EOS);
           nextBeams.push({
-            ids:     [...beam.ids, nextId],
-            logProb: beam.logProb + probs[k].logprob,
+            ids:      [...beam.ids, nextId],
+            logProb:  beam.logProb + probs[k].logprob,
+            genCount: beam.genCount + 1,
+            finished,
           });
-          if (nextId === SPECIAL.EOS) break;
+          if (finished) break;
         }
       }
 
@@ -468,9 +505,10 @@ class AKIEModel {
       beams.splice(0, beams.length, ...nextBeams.slice(0, this.hparams.beamSize));
     }
 
-    const best = beams.reduce((b, c) => c.logProb > b.logProb ? c : b, beams[0]);
-    const out  = best.ids.filter(id => id !== SPECIAL.EOS && id !== SPECIAL.PAD && id !== SPECIAL.BOS);
-    return out.length ? this.vocab.detokenize(out) : '';
+    const best   = beams.reduce((b, c) => c.logProb > b.logProb ? c : b, beams[0]);
+    // Retornar apenas os tokens GERADOS (após o prompt)
+    const genIds = best.ids.slice(promptIds.length).filter(id => id !== SPECIAL.EOS && id !== SPECIAL.PAD && id !== SPECIAL.BOS);
+    return genIds.length ? this.vocab.detokenize(genIds) : '';
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -521,159 +559,6 @@ class AKIEModel {
     await fs.promises.rename(tmpDir, dir);
 
     console.log(`[AKIE] ✓ Modelo v2.0 salvo em ${dir} (steps: ${this.trainSteps})`);
-  }
-
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // saveToFirestore — persiste pesos como base64 no Firestore
-  // Firestore tem limite de 1MB por documento; pesos ~7.8MB (1.95M params × 4B).
-  // Estratégia: chunking em fatias de 700KB base64 → N documentos na subcoleção
-  // akie_model_chunks/{chunkIndex}, com manifesto em akie_worker_status/model_snapshot.
-  // ─────────────────────────────────────────────────────────────────────────
-
-  async saveToFirestore(db) {
-    if (!this.ready || !db) return false;
-
-    const CHUNK_BYTES = 700_000; // ~700KB por documento — abaixo do limite de 1MB do Firestore
-
-    try {
-      console.log('[FIRESTORE-SAVE] Serializando pesos...');
-      const weights  = this.model.getWeights();
-      const manifest = weights.map(w => ({ name: w.name, shape: w.shape }));
-
-      // Montar buffer único com todos os pesos
-      const allData     = weights.map(w => w.dataSync());
-      const totalFloats = allData.reduce((sum, arr) => sum + arr.length, 0);
-      const buffer      = Buffer.allocUnsafe(totalFloats * 4);
-      let offset = 0;
-      for (const arr of allData) {
-        for (const v of arr) { buffer.writeFloatLE(v, offset); offset += 4; }
-      }
-
-      // Fatiar em chunks de 700KB
-      const b64     = buffer.toString('base64');
-      const chunks  = [];
-      for (let i = 0; i < b64.length; i += CHUNK_BYTES) {
-        chunks.push(b64.slice(i, i + CHUNK_BYTES));
-      }
-
-      console.log(`[FIRESTORE-SAVE] ${totalFloats} floats → ${buffer.length} bytes → ${chunks.length} chunks`);
-
-      // Salvar chunks em lotes (Firestore batch max 500 ops)
-      const chunkColl = db.collection('akie_model_chunks');
-      for (let i = 0; i < chunks.length; i++) {
-        await chunkColl.doc(String(i).padStart(4, '0')).set({
-          index: i,
-          data:  chunks[i],
-          total: chunks.length,
-          savedAt: new Date().toISOString(),
-        });
-      }
-
-      // Manifesto e metadados no documento principal
-      const vocabJSON = this.vocab.toJSON();
-      const meta = {
-        ok:                 true,
-        trainSteps:         this.trainSteps,
-        vocabSize:          this.vocab.size,
-        embeddingVocabSize: this.embeddingVocabSize,
-        hparams:            this.hparams,
-        savedAt:            new Date().toISOString(),
-        chunkCount:         chunks.length,
-        totalBytes:         buffer.length,
-        manifest:           JSON.stringify(manifest),
-        modelVersion:       this.hparams.modelVersion,
-      };
-
-      await db.collection('akie_worker_status').doc('model_snapshot').set(meta);
-
-      // Vocab separado (pode ser grande — salvo em doc próprio)
-      await db.collection('akie_worker_status').doc('vocabulary').set(vocabJSON, { merge: false });
-
-      console.log(`[FIRESTORE-SAVE] ✓ Modelo salvo no Firestore (${chunks.length} chunks, steps=${this.trainSteps})`);
-      return true;
-    } catch (err) {
-      console.error('[FIRESTORE-SAVE] Falha:', err.message);
-      return false;
-    }
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // loadFromFirestore — restaura pesos do Firestore quando o disco está vazio
-  // ─────────────────────────────────────────────────────────────────────────
-
-  async loadFromFirestore(db) {
-    if (!db) return false;
-
-    try {
-      const snapDoc = await db.collection('akie_worker_status').doc('model_snapshot').get();
-      if (!snapDoc.exists || !snapDoc.data().ok) {
-        console.log('[FIRESTORE-LOAD] Sem snapshot no Firestore.');
-        return false;
-      }
-
-      const meta = snapDoc.data();
-      console.log(`[FIRESTORE-LOAD] Snapshot encontrado: steps=${meta.trainSteps}, chunks=${meta.chunkCount}, saved=${meta.savedAt}`);
-
-      // Validar compatibilidade de arquitetura antes de carregar
-      const savedHparams = meta.hparams || {};
-      if (
-        savedHparams.embDim     !== this.hparams.embDim    ||
-        savedHparams.hiddenSize !== this.hparams.hiddenSize ||
-        savedHparams.maxSeqLen  !== this.hparams.maxSeqLen
-      ) {
-        console.warn('[FIRESTORE-LOAD] Arquitetura incompatível — ignorando snapshot.');
-        return false;
-      }
-
-      // Ler todos os chunks em ordem
-      const chunkColl = db.collection('akie_model_chunks');
-      const b64Parts  = [];
-      for (let i = 0; i < meta.chunkCount; i++) {
-        const doc = await chunkColl.doc(String(i).padStart(4, '0')).get();
-        if (!doc.exists) throw new Error(`Chunk ${i} ausente`);
-        b64Parts.push(doc.data().data);
-      }
-
-      const buffer   = Buffer.from(b64Parts.join(''), 'base64');
-      const manifest = JSON.parse(meta.manifest);
-
-      // Reconstruir tensores
-      this.embeddingVocabSize = meta.embeddingVocabSize || meta.vocabSize || this.vocab.size;
-      const shellVocab = { ...this.vocab, size: this.embeddingVocabSize };
-      const shell = new AKIEModel(shellVocab, this.hparams);
-      shell.embeddingVocabSize = this.embeddingVocabSize;
-      shell.build();
-
-      let bufOffset = 0;
-      const tensors = manifest.map(w => {
-        const numFloats = w.shape.reduce((a, b) => a * b, 1);
-        const arr = new Float32Array(numFloats);
-        for (let i = 0; i < numFloats; i++) {
-          arr[i] = buffer.readFloatLE(bufOffset); bufOffset += 4;
-        }
-        return tf.tensor(arr, w.shape, 'float32');
-      });
-
-      shell.model.setWeights(tensors);
-      tensors.forEach(t => t.dispose());
-
-      this.model = shell.model;
-      this.optimizer = tf.train.adam(this.hparams.learningRate);
-      this.model.compile({
-        optimizer: this.optimizer,
-        loss: 'sparseCategoricalCrossentropy',
-        metrics: ['accuracy'],
-      });
-      this.trainSteps = meta.trainSteps || 0;
-      this.ready = true;
-
-      console.log(`[FIRESTORE-LOAD] ✓ Modelo restaurado do Firestore (steps=${this.trainSteps})`);
-      return true;
-    } catch (err) {
-      console.error('[FIRESTORE-LOAD] Falha ao restaurar:', err.message);
-      return false;
-    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
