@@ -17,6 +17,58 @@
 const { tokenizeText, makeTrainingPairs } = require('./_akie_vocab');
 
 // ---------------------------------------------------------------------------
+// IDENTIDADE FIXA — pares canônicos injetados em todo ciclo de treino.
+// Garante que o modelo SEMPRE tenha representação consistente de si mesmo.
+// Peso 3x no treino — identidade deve dominar sobre dados ruidosos.
+// ---------------------------------------------------------------------------
+
+const IDENTITY_PAIRS = [
+  { u: 'quem é você',              a: 'Sou a AKIE, uma inteligência artificial em desenvolvimento contínuo.' },
+  { u: 'qual é o seu nome',        a: 'Meu nome é AKIE.' },
+  { u: 'você é uma ia',            a: 'Sim, sou a AKIE, uma IA criada para aprender e conversar.' },
+  { u: 'o que você é',             a: 'Sou a AKIE, uma inteligência artificial que aprende por interação.' },
+  { u: 'me apresente você',        a: 'Olá! Sou a AKIE, uma IA em aprendizado contínuo.' },
+  { u: 'você é humano',            a: 'Não, sou uma inteligência artificial chamada AKIE.' },
+  { u: 'oi',                       a: 'Olá! Como posso ajudar?' },
+  { u: 'olá',                      a: 'Olá! Estou aqui. O que você precisa?' },
+  { u: 'tudo bem',                 a: 'Tudo bem! E você, como está?' },
+  { u: 'bom dia',                  a: 'Bom dia! Em que posso ajudar?' },
+  { u: 'boa tarde',                a: 'Boa tarde! Como posso te ajudar?' },
+  { u: 'boa noite',                a: 'Boa noite! Pode falar.' },
+  { u: 'o que você sabe fazer',    a: 'Posso conversar, responder perguntas e aprender com nossas interações.' },
+  { u: 'você pode me ajudar',      a: 'Claro! Diga o que precisa.' },
+  { u: 'como você aprende',        a: 'Aprendo por interação contínua e por extração de padrões da web.' },
+  { u: 'tchau',                    a: 'Até mais! Foi bom conversar.' },
+  { u: 'até logo',                 a: 'Até logo! Qualquer coisa estou aqui.' },
+  { u: 'obrigado',                 a: 'De nada! Estou aqui sempre que precisar.' },
+];
+
+function identityToTrainingPairs(vocab) {
+  const allPairs = [];
+  const MAX_SEQ  = 64;
+  const WEIGHT   = 3;
+
+  for (const pair of IDENTITY_PAIRS) {
+    const contextTokens  = vocab.tokenize(`u: ${pair.u}`);
+    const responseTokens = vocab.tokenize(`a: ${pair.a}`);
+    if (!contextTokens.length || responseTokens.length < 2) continue;
+
+    for (let pos = 1; pos < responseTokens.length; pos++) {
+      const prefix    = responseTokens.slice(0, pos);
+      const rawSeq    = [...contextTokens, ...prefix];
+      const truncated = rawSeq.slice(-(MAX_SEQ - 1));
+      const padded    = [
+        ...Array(Math.max(0, MAX_SEQ - truncated.length)).fill(0),
+        ...truncated,
+      ];
+      const p = { x: padded, y: responseTokens[pos] };
+      for (let w = 0; w < WEIGHT; w++) allPairs.push(p);
+    }
+  }
+  return allPairs;
+}
+
+// ---------------------------------------------------------------------------
 // NLP NATIVO — sem dependência externa de `natural`
 // Resolve o erro "[NLP] `natural` não encontrada" sem instalar pacotes.
 // Stemmer PT-BR minimalista por sufixo.
@@ -166,6 +218,14 @@ function episodesToPairs(episodes, vocab) {
     const responseTokens = vocab.tokenize(`a: ${respText}`);
     if (!contextTokens.length || responseTokens.length < 2) continue;
 
+    // Rejeitar pares onde a resposta ecoa o input (Jaccard > 60%)
+    const userTokenSet = new Set(tokenizeText(userText));
+    const respToks     = tokenizeText(respText);
+    if (respToks.length > 0) {
+      const echoCount = respToks.filter(t => userTokenSet.has(t)).length;
+      if (echoCount / respToks.length > 0.6) continue;
+    }
+
     const weight = ep.feedback === 'positive' ? 2 : 1;
 
     for (let pos = 1; pos < responseTokens.length; pos++) {
@@ -310,9 +370,8 @@ function graphSentencesToPairs(sentences, vocab) {
   const allPairs = [];
   const MAX_SEQ  = 64;
 
-  // Cap de pares por ciclo de consolidação: evita explosão de RAM/CPU no Railway.
-  // 80 frases × ~6 tokens/frase × teacher-forcing = ~480 pares máximo, processado em <15s.
-  const MAX_PAIRS_PER_CONSOLIDATION = 600;
+  // Identidade sempre presente — mesmo ciclos de CONSOLIDATION devem reforçar
+  allPairs.push(...identityToTrainingPairs(vocab));
 
   // Prefixos variados para reduzir overfitting no stub de pergunta
   const STUBS = [
@@ -324,8 +383,6 @@ function graphSentencesToPairs(sentences, vocab) {
   ];
 
   for (let i = 0; i < sentences.length; i++) {
-    if (allPairs.length >= MAX_PAIRS_PER_CONSOLIDATION) break;
-
     const sentence = sentences[i];
     if (!sentence) continue;
 
@@ -343,7 +400,6 @@ function graphSentencesToPairs(sentences, vocab) {
 
     // Teacher-forcing por posição — formato idêntico ao SYNTHETIC e INTERACTIVE
     for (let pos = 1; pos < responseTokens.length; pos++) {
-      if (allPairs.length >= MAX_PAIRS_PER_CONSOLIDATION) break;
       const prefix    = responseTokens.slice(0, pos);
       const rawSeq    = [...contextTokens, ...prefix];
       const truncated = rawSeq.slice(-(MAX_SEQ - 1));
@@ -754,8 +810,8 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
       const generated = await model.generate(prompt, 20, 0.7);
       if (!generated) continue;
 
-      const quality = scoreGeneration(generated, vocab);
-      if (quality >= 0.35) {
+      const quality = scoreGeneration(generated, vocab, prompt);
+      if (quality >= 0.50) { // threshold elevado: bloqueia respostas mediocres
         // Formato consistente com SYNTHETIC: u: {prompt} a: {generated}
         const contextTokens  = vocab.tokenize(`u: ${prompt}`);
         const responseTokens = vocab.tokenize(`a: ${generated}`);
@@ -807,23 +863,40 @@ async function selfPlayPairs(model, db, vocab, rounds = 10) {
   return allPairs;
 }
 
-function scoreGeneration(text, vocab) {
+function scoreGeneration(text, vocab, prompt) {
+  prompt = prompt || '';
   if (!text || text.length < 5) return 0;
-  const tokens  = tokenizeText(text);
+  const tokens = tokenizeText(text);
   if (tokens.length < 2) return 0;
+
   const unique     = new Set(tokens);
   const divScore   = unique.size / tokens.length;
   const knownCount = tokens.filter(t => vocab.token2id[t] !== undefined).length;
   const knownScore = knownCount / tokens.length;
-  const lenScore   = tokens.length >= 4 && tokens.length <= 40 ? 1.0 : 0.5;
-  // v7: penalidade para padrões repetitivos detectados em produção
-  const REPETITION_PHRASES = [
+  // comprimento ideal: 4-25 tokens
+  const lenScore   = tokens.length >= 4 && tokens.length <= 25 ? 1.0 : 0.4;
+
+  // Penalidade por eco: se >50% dos tokens da resposta estão no prompt → bloquear
+  let echoPenalty = 1.0;
+  if (prompt) {
+    const promptTokens = new Set(tokenizeText(prompt));
+    const echoCount    = tokens.filter(t => promptTokens.has(t)).length;
+    const echoRatio    = echoCount / tokens.length;
+    if (echoRatio > 0.5)      echoPenalty = 0.15;
+    else if (echoRatio > 0.3) echoPenalty = 0.55;
+  }
+
+  // Padrões incoerentes conhecidos
+  const BAD_PATTERNS = [
     'pode dar mais detalhes', 'pode me explicar o que',
     'nao tenho representacao', 'pode reformular',
+    'que você', 'como assim você', 'você você', 'é é', 'que que',
   ];
-  const lowerText = text.toLowerCase();
-  const repetitionPenalty = REPETITION_PHRASES.some(p => lowerText.includes(p)) ? 0.5 : 1.0;
-  return (divScore * 0.35 + knownScore * 0.45 + lenScore * 0.20) * repetitionPenalty;
+  const lowerText    = text.toLowerCase();
+  const patPenalty   = BAD_PATTERNS.some(p => lowerText.includes(p)) ? 0.1 : 1.0;
+
+  if (unique.size < 3) return 0;
+  return (divScore * 0.30 + knownScore * 0.40 + lenScore * 0.30) * echoPenalty * patPenalty;
 }
 
 // ---------------------------------------------------------------------------
@@ -846,4 +919,6 @@ module.exports = {
   sanitizeNodeId,
   EXPANSION_CONFIG,
   promoteGeneratedNodes,
+  identityToTrainingPairs,
+  IDENTITY_PAIRS,
 };
