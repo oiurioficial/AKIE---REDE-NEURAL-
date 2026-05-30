@@ -109,6 +109,8 @@ function cleanGeneratedText(raw) {
 
   let text = raw
     .replace(/<UNK>/gi, '')
+    // Remover prefixos de turno que o modelo possa ter gerado
+    .replace(/^[ua]\s*:\s*/i, '')
     .replace(/\bu\s*:\s*/gi, '')
     .replace(/\ba\s*:\s*/gi, '')
     .replace(/\s([?.!,;:])/g, '$1')
@@ -270,8 +272,16 @@ function startHttpServer() {
           const genMaxTokens = max_tokens  || modeLimits.maxTokens;
           const genTemp      = temperature || modeLimits.temperature;
 
-          // [PATCH v2.3.1] Normalizar \n entre u: e a: — evita token UNK no separador
-          const normalizedPrompt = prompt.replace(/\n\s*/g, ' ').trim();
+          // [PATCH v2.1] Normalizar prompt para formato exato de treino: "u: X a:"
+          // Os templates sintéticos usam esse formato como contexto.
+          let normalizedPrompt = prompt.replace(/\n\s*/g, ' ').trim();
+          if (!normalizedPrompt.endsWith('a:')) {
+            const userMsg = normalizedPrompt
+              .replace(/^u\s*:\s*/i, '')
+              .replace(/\s*a\s*:\s*$/, '')
+              .trim();
+            normalizedPrompt = `u: ${userMsg} a:`;
+          }
           const rawGenerated = await state.model.generate(normalizedPrompt, genMaxTokens, genTemp);
 
           const cleanGenerated = cleanGeneratedText(rawGenerated);
