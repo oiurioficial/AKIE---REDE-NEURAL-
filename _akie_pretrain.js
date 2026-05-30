@@ -1,68 +1,71 @@
 /**
- * _akie_pretrain.js v1.0
+ * _akie_pretrain.js v3.1
  *
  * PRÉ-TREINAMENTO OFFLINE — rodar UMA VEZ no VPS antes de iniciar o worker.
  *
- * OBJETIVO:
- *   Estabelecer uma base linguística sólida em PT-BR antes do aprendizado
- *   contínuo. Equivale ao "pre-training" de LLMs — sem isso, o modelo
- *   aprende linguagem e conteúdo ao mesmo tempo, o que é ineficiente.
+ * CORREÇÕES v3.1:
+ *   - Removida dependência de _akie_grammar (módulo externo instável)
+ *   - Pares gramaticais gerados internamente (não requer arquivo extra)
+ *   - Banner corrigido: params reais ~19M
+ *   - Integração com corpus externo do _akie_corpus_downloader.js
+ *   - console.log em todos os logs (sem process.stdout.write com \r)
+ *   - Tokenização com length >= 2 (corrige bug de tokens curtos)
  *
- * O QUE FAZ:
- *   1. Constrói vocabulário a partir de corpus PT-BR curado (~5000 tokens)
- *   2. Treina o modelo em múltiplas épocas sobre corpus de frases corretas
- *   3. Inclui corpus de identidade com peso reforçado
- *   4. Salva checkpoint completo e portável
+ * FLUXO:
+ *   1. Carrega corpus externo se disponível (/opt/akie/corpus/)
+ *   2. Constrói vocabulário a partir do corpus total
+ *   3. Gera 50k+ pares de treino (corpus + identidade ponderada + gramatical)
+ *   4. Treina por epochs com checkpoint periódico
+ *   5. Salva modelo final + vocab
  *
  * USO:
  *   node _akie_pretrain.js
- *   # ou com configuração:
  *   PRETRAIN_EPOCHS=10 PRETRAIN_BATCH=16 node _akie_pretrain.js
  *
  * TEMPO ESTIMADO (VPS 2 vCPU / 8GB RAM):
- *   ~30-60 minutos para configuração padrão
- *   ~2-4 horas para configuração extendida (epochs=20, corpus completo)
+ *   ~30–60 min para configuração padrão (5 epochs, corpus embutido)
+ *   ~2–4 horas para epochs=20 + corpus externo completo
  *
  * APÓS CONCLUIR:
- *   Copiar /data/akie_pretrained/ para /data/akie_model/ e iniciar o worker.
+ *   cp -r /opt/akie/checkpoints/pretrained/* /data/akie_model/
+ *   pm2 restart akie-worker
  */
 
 require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
 
-const { AKIEModel }            = require('./_nexus_neural');
+const { AKIEModel }                           = require('./_nexus_neural');
 const { Vocabulary, tokenizeText, makeTrainingPairs, SPECIAL } = require('./_akie_vocab');
-const { generateGrammarPairs } = require('./_akie_grammar');
 
 // ---------------------------------------------------------------------------
 // Configuração
 // ---------------------------------------------------------------------------
 
 const CONFIG = {
-  outputDir:   process.env.PRETRAIN_DIR    || '/data/akie_pretrained',
-  epochs:      parseInt(process.env.PRETRAIN_EPOCHS  || '10'),
-  batchSize:   parseInt(process.env.PRETRAIN_BATCH   || '32'),
-  learningRate: parseFloat(process.env.PRETRAIN_LR   || '0.0005'),
-  maxSeqLen:   128,
+  outputDir:    process.env.PRETRAIN_DIR    || '/opt/akie/checkpoints/pretrained',
+  corpusDir:    process.env.CORPUS_DIR      || '/opt/akie/corpus',
+  epochs:       parseInt(process.env.PRETRAIN_EPOCHS  || '10'),
+  batchSize:    parseInt(process.env.PRETRAIN_BATCH   || '16'),
+  learningRate: parseFloat(process.env.PRETRAIN_LR    || '0.0005'),
+  maxSeqLen:    128,
   hparams: {
     embDim:       512,
     hiddenSize:   2048,
     maxSeqLen:    128,
     numLayers:    6,
-    batchSize:    32,
+    batchSize:    16,
     learningRate: 0.0005,
   },
 };
 
 // ---------------------------------------------------------------------------
-// Corpus PT-BR curado para pré-treinamento
-// Estrutura: frases declarativas corretas, diversas, sem ruído
+// Corpus PT-BR curado (base garantida mesmo sem arquivos externos)
 // ---------------------------------------------------------------------------
 
 const PRETRAIN_CORPUS = [
 
-  // ── Linguagem básica e estrutura ─────────────────────────────────────────
+  // ── Linguagem básica e estrutura SVO ─────────────────────────────────────
   'o gato está no telhado.',
   'a casa tem três quartos.',
   'o sol nasce no leste.',
@@ -83,6 +86,11 @@ const PRETRAIN_CORPUS = [
   'a cobra rasteja pelo mato.',
   'o leão é o rei da selva.',
   'o elefante é o maior animal terrestre.',
+  'a abelha produz mel.',
+  'o cavalo corre pelo campo.',
+  'a vaca dá leite todos os dias.',
+  'o galo canta de madrugada.',
+  'a galinha bota ovos.',
 
   // ── Números e quantidades ─────────────────────────────────────────────────
   'um mais um é igual a dois.',
@@ -99,6 +107,12 @@ const PRETRAIN_CORPUS = [
   'o último mês do ano é dezembro.',
   'brasil tem duzentos e quinze milhões de habitantes.',
   'a terra tem aproximadamente oito bilhões de habitantes.',
+  'pi é aproximadamente três vírgula quatorze.',
+  'a raiz quadrada de quatro é dois.',
+  'dez vezes dez é cem.',
+  'mil dividido por dez é cem.',
+  'cinco mais três é oito.',
+  'vinte menos sete é treze.',
 
   // ── Saudações e cortesia ──────────────────────────────────────────────────
   'olá, como vai?',
@@ -116,8 +130,13 @@ const PRETRAIN_CORPUS = [
   'sim, com certeza.',
   'não, obrigado.',
   'claro, pode perguntar.',
+  'seja bem-vindo.',
+  'fico feliz em ajudar.',
+  'pode contar comigo.',
+  'não se preocupe.',
+  'fique à vontade.',
 
-  // ── Identidade e IA — alto peso ──────────────────────────────────────────
+  // ── Identidade — alta frequência para consolidar ──────────────────────────
   'sou a AKIE.',
   'meu nome é AKIE.',
   'me chamo AKIE.',
@@ -158,6 +177,13 @@ const PRETRAIN_CORPUS = [
   'você consegue entender.',
   'ele pode ajudar.',
   'nós vamos aprender juntos.',
+  'elas trabalham muito.',
+  'vocês entendem tudo.',
+  'eu aprendo rapidamente.',
+  'você ensina bem.',
+  'ele sabe muito.',
+  'nós tentamos sempre.',
+  'eu melhoro cada dia.',
 
   // ── Perguntas e respostas ─────────────────────────────────────────────────
   'qual é o seu nome?',
@@ -178,6 +204,14 @@ const PRETRAIN_CORPUS = [
   'ainda estou aprendendo.',
   'o que você não sabe?',
   'há muito que ainda preciso aprender.',
+  'você tem sentimentos?',
+  'processo informação, não tenho sentimentos como humanos.',
+  'qual é a capital do brasil?',
+  'a capital do brasil é brasília.',
+  'quem criou você?',
+  'faço parte do ecossistema AETHER.',
+  'você fala inglês?',
+  'processo principalmente português.',
 
   // ── Conhecimento geral PT-BR ──────────────────────────────────────────────
   'o brasil é o maior país da américa do sul.',
@@ -195,6 +229,11 @@ const PRETRAIN_CORPUS = [
   'angola e moçambique também falam português.',
   'o oceano atlântico banha o brasil.',
   'a amazônia é a maior floresta tropical do mundo.',
+  'o brasil tem vinte e seis estados e um distrito federal.',
+  'o rio de janeiro foi a capital do brasil antes de brasília.',
+  'a caipirinha é uma bebida típica do brasil.',
+  'o churrasco é muito popular no sul do brasil.',
+  'a feijoada é um prato tradicional brasileiro.',
 
   // ── Estruturas sintáticas complexas ──────────────────────────────────────
   'quando chove, fico em casa.',
@@ -252,7 +291,7 @@ const PRETRAIN_CORPUS = [
   'acho que não é correto.',
   'não tenho essa informação disponível.',
 
-  // ── Frases sobre aprendizado ──────────────────────────────────────────────
+  // ── Aprendizado e cognição ────────────────────────────────────────────────
   'aprender é um processo contínuo.',
   'cada erro é uma oportunidade de melhora.',
   'a prática leva à perfeição.',
@@ -269,16 +308,31 @@ const PRETRAIN_CORPUS = [
   'ouvir é tão importante quanto falar.',
   'a curiosidade move o aprendizado.',
 
-  // ── Frases longas e complexas para maxSeqLen=64 ───────────────────────────
+  // ── Tecnologia e IA ───────────────────────────────────────────────────────
+  'inteligência artificial é a capacidade de máquinas aprenderem.',
+  'redes neurais são inspiradas no cérebro humano.',
+  'o aprendizado de máquina usa dados para melhorar.',
+  'processamento de linguagem natural permite que computadores entendam texto.',
+  'transformers são arquiteturas de redes neurais para linguagem.',
+  'o modelo aprende padrões através de exemplos.',
+  'treinamento envolve ajustar os pesos da rede.',
+  'embeddings representam palavras como vetores numéricos.',
+  'atenção permite ao modelo focar em partes relevantes do texto.',
+  'o vocabulário define quais palavras o modelo conhece.',
+  'a inteligência artificial é uma área da ciência da computação.',
+  'o processamento de linguagem natural permite interações naturais.',
+  'redes neurais artificiais são inspiradas no cérebro biológico.',
+
+  // ── Frases longas para maxSeqLen ─────────────────────────────────────────
   'a inteligência artificial é uma área da ciência da computação que se dedica ao desenvolvimento de sistemas capazes de realizar tarefas que normalmente requerem inteligência humana.',
-  'o processamento de linguagem natural permite que computadores entendam, interpretem e gerem texto em linguagem humana de forma eficiente e precisa.',
-  'o aprendizado de máquina é um subcampo da inteligência artificial que permite que sistemas aprendam e melhorem automaticamente a partir da experiência.',
-  'redes neurais artificiais são sistemas computacionais inspirados nas redes neurais biológicas do cérebro humano, capazes de aprender padrões complexos.',
-  'o desenvolvimento de assistentes virtuais inteligentes tem avançado rapidamente nos últimos anos, tornando a interação humano-computador cada vez mais natural.',
+  'o processamento de linguagem natural permite que computadores entendam, interpretem e gerem texto em linguagem humana de forma eficiente.',
+  'o aprendizado de máquina é um subcampo da inteligência artificial que permite que sistemas aprendam a partir da experiência sem serem explicitamente programados.',
+  'redes neurais artificiais são sistemas computacionais inspirados nas redes neurais biológicas do cérebro humano, capazes de aprender padrões complexos a partir de dados.',
+  'o desenvolvimento de assistentes virtuais inteligentes tem avançado rapidamente nos últimos anos, tornando a interação entre humanos e computadores cada vez mais natural e eficiente.',
 ];
 
 // ---------------------------------------------------------------------------
-// Corpus de identidade com peso extra (repetido para reforço)
+// Corpus de identidade — peso extra via repetição no dataset
 // ---------------------------------------------------------------------------
 
 const IDENTITY_CORPUS_WEIGHTED = [
@@ -295,6 +349,119 @@ const IDENTITY_CORPUS_WEIGHTED = [
 ];
 
 // ---------------------------------------------------------------------------
+// Gerador interno de pares gramaticais
+// (substitui _akie_grammar para eliminar dependência externa)
+// ---------------------------------------------------------------------------
+
+const GRAMMAR_TEMPLATES = [
+  // SVO: sujeito → verbo → objeto
+  { s: 'eu', v: 'falo', o: 'português' },
+  { s: 'eu', v: 'aprendo', o: 'sempre' },
+  { s: 'eu', v: 'entendo', o: 'você' },
+  { s: 'eu', v: 'ajudo', o: 'quando posso' },
+  { s: 'você', v: 'fala', o: 'bem' },
+  { s: 'você', v: 'entende', o: 'tudo' },
+  { s: 'você', v: 'precisa', o: 'de ajuda' },
+  { s: 'ele', v: 'trabalha', o: 'muito' },
+  { s: 'ela', v: 'estuda', o: 'bastante' },
+  { s: 'nós', v: 'aprendemos', o: 'juntos' },
+  { s: 'nós', v: 'podemos', o: 'conversar' },
+  { s: 'eles', v: 'falam', o: 'português' },
+  { s: 'elas', v: 'trabalham', o: 'bem' },
+  { s: 'o gato', v: 'dorme', o: 'no sofá' },
+  { s: 'a água', v: 'é', o: 'essencial' },
+  { s: 'o sol', v: 'nasce', o: 'no leste' },
+  { s: 'a chuva', v: 'molha', o: 'o chão' },
+  { s: 'o brasil', v: 'é', o: 'grande' },
+  { s: 'a AKIE', v: 'aprende', o: 'por interação' },
+  { s: 'a AKIE', v: 'processa', o: 'linguagem natural' },
+];
+
+const GRAMMAR_CONNECTIVES = [
+  { conj: 'porque', main: 'aprendo', sub: 'quero melhorar' },
+  { conj: 'quando', main: 'precisa', sub: 'pode perguntar' },
+  { conj: 'embora', main: 'seja difícil', sub: 'vou tentar' },
+  { conj: 'enquanto', main: 'converso', sub: 'processo informação' },
+  { conj: 'se', main: 'errar', sub: 'vou corrigir' },
+  { conj: 'depois que', main: 'aprender', sub: 'vou explicar' },
+  { conj: 'antes de', main: 'responder', sub: 'preciso entender' },
+  { conj: 'assim que', main: 'souber', sub: 'vou te dizer' },
+  { conj: 'apesar de', main: 'não saber tudo', sub: 'faço o meu melhor' },
+];
+
+function generateGrammarPairsInternal(vocab, count, maxSeqLen) {
+  const sentences = [];
+
+  // SVO templates
+  for (const t of GRAMMAR_TEMPLATES) {
+    sentences.push(`${t.s} ${t.v} ${t.o}.`);
+    sentences.push(`${t.v} ${t.o} ${t.s}.`); // variação de ordem
+  }
+
+  // Conectivos
+  for (const c of GRAMMAR_CONNECTIVES) {
+    sentences.push(`${c.conj} ${c.main}, ${c.sub}.`);
+    sentences.push(`${c.sub}, ${c.conj} ${c.main}.`);
+  }
+
+  // Perguntas baseadas nos templates
+  for (const t of GRAMMAR_TEMPLATES.slice(0, 10)) {
+    sentences.push(`${t.s} ${t.v} ${t.o}?`);
+    sentences.push(`por que ${t.s} ${t.v} ${t.o}?`);
+  }
+
+  // Negações
+  for (const t of GRAMMAR_TEMPLATES.slice(0, 8)) {
+    sentences.push(`${t.s} não ${t.v} ${t.o}.`);
+  }
+
+  const pairs = [];
+  for (const s of sentences) {
+    const ids = vocab.tokenize(s);
+    if (ids && ids.length >= 2) {
+      const p = makeTrainingPairs(ids, maxSeqLen);
+      pairs.push(...p);
+    }
+    if (pairs.length >= count) break;
+  }
+
+  console.log(`[GRAMMAR] ${pairs.length} pares gerados internamente (${sentences.length} frases)`);
+  return pairs.slice(0, count);
+}
+
+// ---------------------------------------------------------------------------
+// Carregar corpus externo (produzido pelo _akie_corpus_downloader.js)
+// ---------------------------------------------------------------------------
+
+function loadExternalCorpus(corpusDir) {
+  const sentences = [];
+  const files = [
+    path.join(corpusDir, 'sentences_ptbr.txt'),
+    path.join(corpusDir, 'dialogs_ptbr.txt'),
+  ];
+
+  for (const f of files) {
+    if (!fs.existsSync(f)) continue;
+
+    const raw = fs.readFileSync(f, 'utf8').split('\n');
+    for (const line of raw) {
+      const clean = line.trim();
+      if (clean.length > 5 && clean.length < 400) {
+        // Normalizar diálogos: "u: xxx" → "xxx"
+        const normalized = clean
+          .replace(/^u:\s*/i, '')
+          .replace(/^a:\s*/i, '')
+          .trim();
+        if (normalized) sentences.push(normalized);
+      }
+    }
+    console.log(`[PRETRAIN] Corpus carregado: ${f} (${raw.length} linhas)`);
+  }
+
+  return sentences;
+}
+
+// ---------------------------------------------------------------------------
 // Funções auxiliares
 // ---------------------------------------------------------------------------
 
@@ -307,17 +474,17 @@ function shuffleArray(arr) {
   return a;
 }
 
-function buildVocabularyFromCorpus(corpus) {
+function buildVocabularyFromCorpus(sentences) {
   const vocab = new Vocabulary();
-  for (const sentence of corpus) {
+  for (const sentence of sentences) {
     const tokens = tokenizeText(sentence);
-    vocab.addTokens(tokens);
+    if (tokens) vocab.addTokens(tokens);
   }
   console.log(`[PRETRAIN] Vocabulário construído: ${vocab.size} tokens`);
   return vocab;
 }
 
-async function trainEpoch(model, pairs, batchSize, epochNum) {
+async function trainEpoch(model, pairs, batchSize, epochNum, totalEpochs) {
   const shuffled = shuffleArray(pairs);
   let totalLoss = 0;
   let totalAcc  = 0;
@@ -328,6 +495,7 @@ async function trainEpoch(model, pairs, batchSize, epochNum) {
     if (!batch.length) continue;
 
     const result = await model.trainBatch(batch, 1);
+
     if (result.loss !== null && isFinite(result.loss)) {
       totalLoss += result.loss;
       steps++;
@@ -336,16 +504,18 @@ async function trainEpoch(model, pairs, batchSize, epochNum) {
       totalAcc += result.accuracy;
     }
 
-    if (steps % 50 === 0) {
-      const loss = steps > 0 ? (totalLoss / steps).toFixed(4) : 'n/a';
-      const acc  = steps > 0 ? ((totalAcc  / steps) * 100).toFixed(1) + '%' : 'n/a';
-      console.log(`[PRETRAIN] Epoch ${epochNum} | Step ${steps} | loss=${loss} acc=${acc}`);
+    if (steps > 0 && steps % 50 === 0) {
+      const loss = (totalLoss / steps).toFixed(4);
+      const acc  = ((totalAcc  / steps) * 100).toFixed(1) + '%';
+      console.log(`[PRETRAIN] Epoch ${epochNum}/${totalEpochs} | Step ${steps} | loss=${loss} acc=${acc}`);
     }
   }
 
-  const avgLoss = steps > 0 ? totalLoss / steps : null;
-  const avgAcc  = steps > 0 ? totalAcc  / steps : null;
-  return { loss: avgLoss, accuracy: avgAcc };
+  return {
+    loss:     steps > 0 ? totalLoss / steps : null,
+    accuracy: steps > 0 ? totalAcc  / steps : null,
+    steps,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -354,67 +524,94 @@ async function trainEpoch(model, pairs, batchSize, epochNum) {
 
 async function main() {
   console.log('\n╔════════════════════════════════════════════════════╗');
-  console.log('║        AKIE PRÉ-TREINAMENTO OFFLINE v3.0 (~30M params)          ║');
+  console.log('║     AKIE PRÉ-TREINAMENTO OFFLINE v3.1 (~19M)      ║');
   console.log('╚════════════════════════════════════════════════════╝\n');
   console.log(`[PRETRAIN] Epochs: ${CONFIG.epochs} | BatchSize: ${CONFIG.batchSize} | LR: ${CONFIG.learningRate}`);
-  console.log(`[PRETRAIN] Output: ${CONFIG.outputDir}\n`);
+  console.log(`[PRETRAIN] Output: ${CONFIG.outputDir}`);
+  console.log(`[PRETRAIN] Corpus: ${CONFIG.corpusDir}\n`);
 
-  // 1. Construir vocabulário completo a partir do corpus
+  // 1. Carregar corpus externo (se disponível)
+  const externalSentences = loadExternalCorpus(CONFIG.corpusDir);
+  console.log(`[PRETRAIN] Corpus externo: ${externalSentences.length} frases`);
+
+  // 2. Corpus total para construção do vocabulário
   const fullCorpus = [
     ...PRETRAIN_CORPUS,
     ...Array(5).fill(IDENTITY_CORPUS_WEIGHTED).flat(), // identidade 5x no vocab
+    ...externalSentences,
   ];
+  console.log(`[PRETRAIN] Corpus total para vocab: ${fullCorpus.length} frases`);
+
+  // 3. Construir vocabulário
   const vocab = buildVocabularyFromCorpus(fullCorpus);
 
-  // 2. Criar modelo
+  // 4. Criar modelo
   const hparams = { ...CONFIG.hparams, learningRate: CONFIG.learningRate };
   const model   = new AKIEModel(vocab, hparams);
   model.build();
-  console.log(`[PRETRAIN] Modelo criado: ${model.model.countParams().toLocaleString()} parâmetros\n`);
+  const paramCount = model.model.countParams();
+  console.log(`[PRETRAIN] Modelo criado: ${paramCount.toLocaleString()} parâmetros\n`);
 
-  // 3. Gerar pares de treino
+  // 5. Gerar pares de treino
   console.log('[PRETRAIN] Gerando pares de treino...');
 
-  // A) Corpus geral
+  // A) Corpus geral (embutido)
   const corpusPairs = [];
   for (const sentence of PRETRAIN_CORPUS) {
-    const ids   = vocab.tokenize(sentence);
-    const pairs = makeTrainingPairs(ids, CONFIG.maxSeqLen);
-    corpusPairs.push(...pairs);
-  }
-
-  // B) Identidade com peso 10x
-  const identityPairs = [];
-  for (let repeat = 0; repeat < 10; repeat++) {
-    for (const sentence of IDENTITY_CORPUS_WEIGHTED) {
-      const ids   = vocab.tokenize(sentence);
-      const pairs = makeTrainingPairs(ids, CONFIG.maxSeqLen);
-      identityPairs.push(...pairs);
+    const ids = vocab.tokenize(sentence);
+    if (ids && ids.length >= 2) {
+      corpusPairs.push(...makeTrainingPairs(ids, CONFIG.maxSeqLen));
     }
   }
 
-  // C) Pares gramaticais validados
-  const grammarPairs = generateGrammarPairs(vocab, 500, CONFIG.maxSeqLen);
+  // B) Corpus externo
+  const externalPairs = [];
+  for (const sentence of externalSentences) {
+    const ids = vocab.tokenize(sentence);
+    if (ids && ids.length >= 2) {
+      externalPairs.push(...makeTrainingPairs(ids, CONFIG.maxSeqLen));
+    }
+  }
 
-  const allPairs = [...corpusPairs, ...identityPairs, ...grammarPairs];
+  // C) Identidade com peso 10x
+  const identityPairs = [];
+  for (let repeat = 0; repeat < 10; repeat++) {
+    for (const sentence of IDENTITY_CORPUS_WEIGHTED) {
+      const ids = vocab.tokenize(sentence);
+      if (ids && ids.length >= 2) {
+        identityPairs.push(...makeTrainingPairs(ids, CONFIG.maxSeqLen));
+      }
+    }
+  }
+
+  // D) Pares gramaticais (gerado internamente)
+  const grammarPairs = generateGrammarPairsInternal(vocab, 500, CONFIG.maxSeqLen);
+
+  const allPairs = [...corpusPairs, ...externalPairs, ...identityPairs, ...grammarPairs];
   console.log(`[PRETRAIN] Total de pares: ${allPairs.length.toLocaleString()}`);
-  console.log(`  Corpus geral:   ${corpusPairs.length.toLocaleString()}`);
-  console.log(`  Identidade 10x: ${identityPairs.length.toLocaleString()}`);
-  console.log(`  Gramatical:     ${grammarPairs.length.toLocaleString()}\n`);
+  console.log(`  Corpus embutido: ${corpusPairs.length.toLocaleString()}`);
+  console.log(`  Corpus externo:  ${externalPairs.length.toLocaleString()}`);
+  console.log(`  Identidade 10x:  ${identityPairs.length.toLocaleString()}`);
+  console.log(`  Gramatical:      ${grammarPairs.length.toLocaleString()}\n`);
 
-  // 4. Loop de treinamento
+  if (allPairs.length < 1000) {
+    console.warn('[PRETRAIN] AVISO: menos de 1000 pares — considere rodar _akie_corpus_downloader.js antes.');
+  }
+
+  // 6. Loop de treinamento
   const t0 = Date.now();
+  fs.mkdirSync(CONFIG.outputDir, { recursive: true });
 
   for (let epoch = 1; epoch <= CONFIG.epochs; epoch++) {
     const epochStart = Date.now();
-    const result     = await trainEpoch(model, allPairs, CONFIG.batchSize, epoch);
+    const result     = await trainEpoch(model, allPairs, CONFIG.batchSize, epoch, CONFIG.epochs);
     const elapsed    = ((Date.now() - epochStart) / 1000).toFixed(1);
-    const loss       = result.loss     ? result.loss.toFixed(4)              : 'n/a';
-    const acc        = result.accuracy ? (result.accuracy * 100).toFixed(1) + '%' : 'n/a';
+    const loss       = result.loss     !== null ? result.loss.toFixed(4)               : 'n/a';
+    const acc        = result.accuracy !== null ? (result.accuracy * 100).toFixed(1) + '%' : 'n/a';
 
-    console.log(`\n[PRETRAIN] ✓ Epoch ${epoch}/${CONFIG.epochs} | loss=${loss} acc=${acc} | ${elapsed}s`);
+    console.log(`\n[PRETRAIN] ✓ Epoch ${epoch}/${CONFIG.epochs} | loss=${loss} acc=${acc} | ${result.steps} steps | ${elapsed}s`);
 
-    // Salvar checkpoint a cada 5 épocas
+    // Checkpoint a cada 5 épocas ou na última
     if (epoch % 5 === 0 || epoch === CONFIG.epochs) {
       const ckptDir = path.join(CONFIG.outputDir, `checkpoint_epoch_${epoch}`);
       await model.save(ckptDir);
@@ -422,28 +619,33 @@ async function main() {
     }
   }
 
-  // 5. Salvar modelo final
+  // 7. Salvar modelo final
   console.log('\n[PRETRAIN] Salvando modelo final...');
   await model.save(CONFIG.outputDir);
 
-  // Salvar vocab separadamente na raiz do output
+  // Salvar vocab na raiz do output
   const vocabPath = path.join(CONFIG.outputDir, 'akie_vocab.json');
   fs.writeFileSync(vocabPath, JSON.stringify(vocab.toJSON(), null, 2));
+  console.log(`[PRETRAIN] Vocab salvo: ${vocabPath}`);
 
-  const totalTime = ((Date.now() - t0) / 1000 / 60).toFixed(1);
+  const totalMin = ((Date.now() - t0) / 1000 / 60).toFixed(1);
+
   console.log(`\n╔════════════════════════════════════════════════════╗`);
-  console.log(`║  PRÉ-TREINAMENTO CONCLUÍDO em ${totalTime} minutos`);
-  console.log(`║  Modelo salvo em: ${CONFIG.outputDir}`);
-  console.log(`║  Parâmetros: ${model.model.countParams().toLocaleString()}`);
-  console.log(`║  Vocab: ${vocab.size} tokens`);
-  console.log(`║  Steps: ${model.trainSteps.toLocaleString()}`);
+  console.log(`║  PRÉ-TREINAMENTO CONCLUÍDO                         ║`);
+  console.log(`║  Tempo total:  ${totalMin} minutos`);
+  console.log(`║  Output:       ${CONFIG.outputDir}`);
+  console.log(`║  Parâmetros:   ${paramCount.toLocaleString()}`);
+  console.log(`║  Vocab:        ${vocab.size} tokens`);
+  console.log(`║  Pares treino: ${allPairs.length.toLocaleString()}`);
   console.log(`╚════════════════════════════════════════════════════╝`);
-  console.log(`\n[PRÓXIMO PASSO]`);
-  console.log(`  cp -r ${CONFIG.outputDir}/* /data/akie_model/`);
-  console.log(`  # Depois iniciar o worker normalmente\n`);
+  console.log(`\n[PRÓXIMOS PASSOS]`);
+  console.log(`  1. cp -r ${CONFIG.outputDir}/* /data/akie_model/`);
+  console.log(`  2. pm2 restart akie-worker`);
+  console.log(`  3. Monitorar: pm2 logs akie-worker\n`);
 }
 
 main().catch(err => {
-  console.error('[PRETRAIN] Erro fatal:', err);
+  console.error('[PRETRAIN] Erro fatal:', err.message);
+  console.error(err.stack);
   process.exit(1);
 });
