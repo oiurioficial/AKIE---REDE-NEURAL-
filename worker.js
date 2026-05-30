@@ -44,20 +44,20 @@ const CONFIG = {
     refino:  { maxTokens: 120, temperature: 0.4 },
   },
   hparams: {
-    embDim:       128,
-    hiddenSize:   256,
-    maxSeqLen:    64,
-    batchSize:    4,
-    learningRate: 0.0005,
+    embDim:       512,
+    hiddenSize:   2048,
+    numLayers:    6,
+    maxSeqLen:    128,
+    batchSize:    8,
+    learningRate: 0.0003,
   },
-  // LR diferenciado por modo — INTERACTIVE usa 10x menos para evitar catastrofic forgetting
   learningRates: {
-    INTERACTIVE:   0.00005,
-    CONSOLIDATION: 0.0003,
-    EXPANSION:     0.0003,
-    SYNTHETIC:     0.0005,
-    SELF_PLAY:     0.0002,
-    GRAMMAR:       0.0004,  // LR moderado — reforço direto de pares validados
+    INTERACTIVE:   0.00003,  // muito conservador — modelo grande, forgetting mais severo
+    CONSOLIDATION: 0.0002,
+    EXPANSION:     0.0002,
+    SYNTHETIC:     0.0003,
+    SELF_PLAY:     0.0001,
+    GRAMMAR:       0.0002,
   },
   consolidation: {
     stagnationDelta:  0.005,
