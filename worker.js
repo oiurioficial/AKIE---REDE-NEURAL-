@@ -28,6 +28,7 @@ const {
 } = require('./akie_behavior');
 
 const { generateSyntheticConversations }  = require('./_akie_synthetic');
+const { generateGrammarPairs }            = require('./_akie_grammar');
 const { runDataIngestion }                = require('./_akie_ingest');
 
 const CONFIG = {
@@ -56,6 +57,7 @@ const CONFIG = {
     EXPANSION:     0.0003,
     SYNTHETIC:     0.0005,
     SELF_PLAY:     0.0002,
+    GRAMMAR:       0.0004,  // LR moderado — reforço direto de pares validados
   },
   consolidation: {
     stagnationDelta:  0.005,
@@ -70,6 +72,7 @@ const MODE = {
   EXPANSION:      'EXPANSION',
   SYNTHETIC:      'SYNTHETIC',
   SELF_PLAY:      'SELF_PLAY',
+  GRAMMAR:        'GRAMMAR',
 };
 
 const state = {
@@ -493,7 +496,11 @@ async function scheduler() {
       } else if (slot === 2) {
         mode = MODE.EXPANSION;
       } else if (slot === 3) {
-        mode = MODE.SELF_PLAY;
+        // Alterna GRAMMAR e SELF_PLAY: GRAMMAR nas primeiras 20 iterações de idle,
+        // depois alterna 1:1 para não perder diversidade do self-play
+        mode = (state.idleCycles < 20 || state.idleCycles % 2 === 1)
+          ? MODE.GRAMMAR
+          : MODE.SELF_PLAY;
       }
     }
 
@@ -625,6 +632,12 @@ async function runMode(mode, ctx = {}) {
     case MODE.SELF_PLAY: {
       pairs = await selfPlayPairs(state.model, state.db, state.vocab, 15);
       desc  = `self-play → ${pairs.length} pares`;
+      break;
+    }
+
+    case MODE.GRAMMAR: {
+      pairs = generateGrammarPairs(state.vocab, 300, state.hparams?.maxSeqLen || 64);
+      desc  = `reforço gramatical → ${pairs.length} pares`;
       break;
     }
   }
