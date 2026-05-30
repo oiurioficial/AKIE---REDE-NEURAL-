@@ -46,7 +46,11 @@ function readLastLines(filePath, n = 100) {
   try {
     if (!fs.existsSync(filePath)) return [];
     const content = fs.readFileSync(filePath, 'utf8');
-    const lines   = content.split('\n').filter(l => l.trim());
+    // Split por \n e também por \r (progress lines concatenadas)
+    const lines = content
+      .split(/[\n\r]+/)
+      .map(l => l.trim())
+      .filter(l => l.length > 0);
     return lines.slice(-n);
   } catch { return []; }
 }
