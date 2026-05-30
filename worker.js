@@ -1,6 +1,8 @@
 /**
- * worker.js v2.3  —  AKIE Training Worker + HTTP Endpoint
- * [PATCH] normalizedPrompt: remove \n entre u: e a: antes de gerar
+ * worker.js v2.4  —  AKIE Training Worker + HTTP Endpoint
+ * [FIX] Removido loadFromFirestore/saveToFirestore (não existem em AKIEModel)
+ * [FIX] Inicialização limpa quando não há modelo salvo compatível
+ * [FIX] Endpoint /status expõe métricas reais para o painel
  */
 
 require('dotenv').config();
@@ -36,7 +38,8 @@ const CONFIG = {
   modelDir:   process.env.MODEL_DIR || '/data/akie_model',
   httpPort:   parseInt(process.env.PORT || '3000', 10),
   saveEveryN: 5,
-  saveToFirestoreEveryN: 10, // salva no Firestore a cada 10 ciclos (menos frequente — operação cara)
+  // Firestore apenas para metadados leves — modelo salvo só em disco
+  saveMetaToFirestoreEveryN: 10,
   generationLimits: {
     social:  { maxTokens: 40,  temperature: 0.5 },
     analyze: { maxTokens: 200, temperature: 0.5 },
@@ -52,7 +55,7 @@ const CONFIG = {
     learningRate: 0.0003,
   },
   learningRates: {
-    INTERACTIVE:   0.00003,  // muito conservador — modelo grande, forgetting mais severo
+    INTERACTIVE:   0.00003,
     CONSOLIDATION: 0.0002,
     EXPANSION:     0.0002,
     SYNTHETIC:     0.0003,
@@ -102,6 +105,8 @@ const state = {
     direct:  0,
     neural:  0,
   },
+  // Histórico de loss para o painel
+  lossHistory: [],
 };
 
 let _trainLock = false;
@@ -112,7 +117,6 @@ function cleanGeneratedText(raw) {
 
   let text = raw
     .replace(/<UNK>/gi, '')
-    // Remover prefixos de turno que o modelo possa ter gerado
     .replace(/^[ua]\s*:\s*/i, '')
     .replace(/\bu\s*:\s*/gi, '')
     .replace(/\ba\s*:\s*/gi, '')
@@ -129,36 +133,37 @@ function cleanGeneratedText(raw) {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
-async function safeSave({ firestoreAlso = false } = {}) {
+// ─────────────────────────────────────────────────────────────────────────────
+// safeSave — salva modelo em disco + metadados leves no Firestore
+// NÃO usa saveToFirestore (não existe em AKIEModel)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function safeSave({ firestoreMetaAlso = false } = {}) {
   if (_saveLock) {
     console.log('[SAVE] Save já em andamento — ignorando chamada duplicada.');
     return;
   }
   _saveLock = true;
   try {
-    // 1. Disco local (volume Railway — pode sumir no próximo deploy)
+    // 1. Disco local — único mecanismo de persistência do modelo
     await state.model.save(CONFIG.modelDir);
     await saveVocab(state.vocab);
     state.lastSaveCycle = state.cycle;
     await reportStatus('periodic');
 
-    // 2. Firestore (persistência cross-deploy) — ativo a cada Nth ciclo ou no SIGTERM
-    if (firestoreAlso && state.db) {
-      if (typeof state.model.saveToFirestore === 'function') {
-        await state.model.saveToFirestore(state.db);
-      } else {
-        // Fallback: persiste metadados e stats quando AKIEModel não implementa saveToFirestore
-        try {
-          const stats = state.model.getStats ? state.model.getStats() : {};
-          await state.db.collection('akie_worker_status').doc('model_checkpoint').set({
-            saved_at:    new Date().toISOString(),
-            cycle:       state.cycle,
-            train_steps: state.model.trainSteps || 0,
-            stats,
-          }, { merge: true });
-        } catch (fsErr) {
-          console.error('[SAVE] Falha no checkpoint Firestore (fallback):', fsErr.message);
-        }
+    // 2. Firestore — apenas metadados/stats (não os pesos do modelo)
+    if (firestoreMetaAlso && state.db) {
+      try {
+        const stats = state.model.getStats ? state.model.getStats() : {};
+        await state.db.collection('akie_worker_status').doc('model_checkpoint').set({
+          saved_at:    new Date().toISOString(),
+          cycle:       state.cycle,
+          train_steps: state.model.trainSteps || 0,
+          stats,
+        }, { merge: true });
+        console.log('[SAVE] Metadados gravados no Firestore.');
+      } catch (fsErr) {
+        console.error('[SAVE] Falha no checkpoint Firestore (não fatal):', fsErr.message);
       }
     }
   } catch (err) {
@@ -167,6 +172,10 @@ async function safeSave({ firestoreAlso = false } = {}) {
     _saveLock = false;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP Server
+// ─────────────────────────────────────────────────────────────────────────────
 
 function startHttpServer() {
   const server = http.createServer(async (req, res) => {
@@ -183,13 +192,13 @@ function startHttpServer() {
       return;
     }
 
-    // ── Health-check raiz ─────────────────────────────────
+    // ── Health ────────────────────────────────────────────────────────────
     if (req.method === 'GET' && (req.url === '/' || req.url === '/health')) {
       res.writeHead(200, headers);
       res.end(JSON.stringify({
         ok:      true,
         service: 'AKIE Worker',
-        version: '2.3.1',
+        version: '2.4.0',
         status:  state.model?.ready ? 'ready' : 'initializing',
         cycle:   state.cycle,
         steps:   state.model?.trainSteps || 0,
@@ -197,22 +206,37 @@ function startHttpServer() {
       return;
     }
 
+    // ── Status completo — consumido pelo painel ───────────────────────────
     if (req.method === 'GET' && req.url === '/status') {
       const stats = state.model ? state.model.getStats() : { ready: false };
+
+      // Última entrada do histórico de loss
+      const lastEntry = state.lossHistory.length
+        ? state.lossHistory[state.lossHistory.length - 1]
+        : null;
+
       res.writeHead(200, headers);
       res.end(JSON.stringify({
-        ok:                true,
-        cycle:             state.cycle,
-        idle_cycles:       state.idleCycles,
-        metrics:           state.metrics,
-        model:             stats,
-        mode_history:      state.modeHistory.slice(-5),
-        generation_stats:  state.generationStats,
+        ok:                 true,
+        cycle:              state.cycle,
+        idle_cycles:        state.idleCycles,
+        metrics:            state.metrics,
+        model:              stats,
+        mode_history:       state.modeHistory.slice(-5),
+        generation_stats:   state.generationStats,
         model_incompatible: state.modelIncompatible,
+        loss_history:       state.lossHistory.slice(-50),
+        latest: lastEntry ? {
+          cycle:    lastEntry.cycle,
+          loss:     lastEntry.loss,
+          accuracy: lastEntry.accuracy,
+          mode:     lastEntry.mode,
+        } : null,
       }));
       return;
     }
 
+    // ── Generate ──────────────────────────────────────────────────────────
     if (req.method === 'POST' && req.url === '/generate') {
       let body = '';
       req.on('data', chunk => { body += chunk; });
@@ -262,7 +286,7 @@ function startHttpServer() {
             res.writeHead(200, headers);
             res.end(JSON.stringify({
               ok:         true,
-              prompt:     prompt,
+              prompt,
               generated:  behavior.output,
               mode:       behavior.mode,
               confidence: behavior.confidence,
@@ -275,8 +299,6 @@ function startHttpServer() {
           const genMaxTokens = max_tokens  || modeLimits.maxTokens;
           const genTemp      = temperature || modeLimits.temperature;
 
-          // [PATCH v2.1] Normalizar prompt para formato exato de treino: "u: X a:"
-          // Os templates sintéticos usam esse formato como contexto.
           let normalizedPrompt = prompt.replace(/\n\s*/g, ' ').trim();
           if (!normalizedPrompt.endsWith('a:')) {
             const userMsg = normalizedPrompt
@@ -286,17 +308,15 @@ function startHttpServer() {
             normalizedPrompt = `u: ${userMsg} a:`;
           }
           const rawGenerated = await state.model.generate(normalizedPrompt, genMaxTokens, genTemp);
-
           const cleanGenerated = cleanGeneratedText(rawGenerated);
 
           if (!cleanGenerated) {
             const fallbackText = behavior.output || 'Ainda estou aprendendo. Pode reformular?';
             state.generationStats.direct = (state.generationStats.direct || 0) + 1;
-            console.log(`[CHAT-DEBUG] Usuário: ${prompt} | IA: ${fallbackText} [fallback-vazio]`);
             res.writeHead(200, headers);
             res.end(JSON.stringify({
               ok:         true,
-              prompt:     prompt,
+              prompt,
               generated:  fallbackText,
               mode:       behavior.mode,
               confidence: behavior.confidence,
@@ -312,7 +332,7 @@ function startHttpServer() {
           res.writeHead(200, headers);
           res.end(JSON.stringify({
             ok:         true,
-            prompt:     prompt,
+            prompt,
             generated:  cleanGenerated,
             mode:       behavior.mode,
             confidence: behavior.confidence,
@@ -341,12 +361,22 @@ function startHttpServer() {
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// init — inicialização limpa, sem loadFromFirestore
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function init() {
+  // Firebase — apenas para episódios e metadados, não para o modelo
   try {
     const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    state.db = admin.firestore();
-    console.log('[INIT] Firebase conectado.');
+    if (serviceAccount.project_id) {
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+      state.db = admin.firestore();
+      console.log('[INIT] Firebase conectado.');
+    } else {
+      console.warn('[INIT] FIREBASE_SERVICE_ACCOUNT não configurado — rodando sem Firestore.');
+      state.db = null;
+    }
   } catch (err) {
     console.error('[INIT] Firebase indisponível:', err.message);
     state.db = null;
@@ -358,31 +388,20 @@ async function init() {
   state.model = new AKIEModel(state.vocab, CONFIG.hparams);
   console.log(`[INIT] Modelo criado: embDim=${CONFIG.hparams.embDim}, hiddenSize=${CONFIG.hparams.hiddenSize}, maxSeqLen=${CONFIG.hparams.maxSeqLen}`);
 
-  let loaded = await state.model.load(CONFIG.modelDir);
+  // Tentativa de carga do disco — único mecanismo suportado
+  const loaded = await state.model.load(CONFIG.modelDir);
 
   if (!loaded) {
-    // Disco vazio (novo deploy) — tentar restaurar do Firestore antes de reinicializar
-    console.log('[INIT] Disco vazio — tentando restaurar do Firestore...');
-    if (state.db) {
-      loaded = await state.model.loadFromFirestore(state.db);
-      if (loaded) {
-        // Persiste imediatamente no disco para os próximos ciclos não precisarem do Firestore
-        await state.model.save(CONFIG.modelDir);
-        await saveVocab(state.vocab);
-        console.log('[INIT] ✓ Modelo restaurado do Firestore e gravado em disco.');
-      }
-    }
-    if (!loaded) {
-      console.log('[INIT] Nenhum snapshot disponível — inicializando novo modelo.');
-      state.model.build();
-      state.model.ready = true;
-    }
+    // Sem modelo salvo compatível — inicializa do zero sem crash
+    console.log('[INIT] Nenhum modelo compatível encontrado — inicializando novo modelo do zero.');
+    state.model.build();
+    state.model.ready = true;
   }
 
   state.modelLoadedFromBinary = true;
+  console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'} | Steps: ${state.model.trainSteps}`);
 
-  console.log(`[INIT] Modelo pronto: ${state.model.ready ? '✓' : '✗'}`);
-
+  // Seed conversacional se necessário
   if (state.db) {
     try {
       const graphSnap = await state.db.collection('nexus_graph').limit(50).get();
@@ -392,7 +411,7 @@ async function init() {
         await runConversationalSeed(state.db);
       }
     } catch (e) {
-      console.error('[INIT] Erro ao verificar seed:', e.message);
+      console.error('[INIT] Erro ao verificar seed (não fatal):', e.message);
     }
   }
 }
@@ -403,7 +422,7 @@ async function tryLoadModelFromBinary() {
     if (!fs.existsSync(metaPath)) {
       console.log('[LOAD] Meta não encontrado — novo modelo.');
       state.model.build();
-      state.model.ready          = true;
+      state.model.ready           = true;
       state.modelLoadedFromBinary = true;
       return true;
     }
@@ -416,28 +435,21 @@ async function tryLoadModelFromBinary() {
       loadedHparams.hiddenSize !== CONFIG.hparams.hiddenSize  ||
       loadedHparams.maxSeqLen  !== CONFIG.hparams.maxSeqLen
     ) {
-      console.warn('\n╔══════════════════════════════════════════════════════════════╗');
-      console.warn('║  ⚠️  RESET AUTOMÁTICO DISPARADO                               ║');
-      console.warn('╠══════════════════════════════════════════════════════════════╣');
-      console.warn(`║  Carregado: [emb=${loadedHparams.embDim || 64} | hidden=${loadedHparams.hiddenSize || 128} | seq=${loadedHparams.maxSeqLen || 32}]`);
-      console.warn(`║  Esperado:  [emb=${CONFIG.hparams.embDim} | hidden=${CONFIG.hparams.hiddenSize} | seq=${CONFIG.hparams.maxSeqLen}]`);
-      console.warn('╚══════════════════════════════════════════════════════════════╝\n');
+      console.warn('[LOAD] ⚠️  Modelo salvo incompatível com arquitetura atual — recriando do zero.');
 
-      const bakPath = `${CONFIG.modelDir}_v1_backup`;
+      const bakPath = `${CONFIG.modelDir}_v_backup_${Date.now()}`;
       if (fs.existsSync(CONFIG.modelDir)) {
         try {
-          await fs.promises.rm(bakPath, { recursive: true, force: true });
-          await fs.promises.mkdir(path.dirname(bakPath), { recursive: true });
           await fs.promises.rename(CONFIG.modelDir, bakPath);
-          console.log(`[LOAD] Backup criado em: ${bakPath}`);
+          console.log(`[LOAD] Backup do modelo antigo criado em: ${bakPath}`);
         } catch (e) {
           console.warn(`[LOAD] Não foi possível fazer backup: ${e.message}`);
         }
       }
 
-      state.modelIncompatible    = true;
+      state.modelIncompatible     = true;
       state.model.build();
-      state.model.ready          = true;
+      state.model.ready           = true;
       state.modelLoadedFromBinary = true;
       return true;
     }
@@ -446,13 +458,17 @@ async function tryLoadModelFromBinary() {
     state.modelLoadedFromBinary = true;
     return loaded || state.model.ready;
   } catch (err) {
-    console.error('[LOAD] Erro ao carregar modelo:', err.message);
+    console.error('[LOAD] Erro ao carregar modelo — recriando do zero:', err.message);
     state.model.build();
-    state.model.ready          = true;
+    state.model.ready           = true;
     state.modelLoadedFromBinary = true;
     return true;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scheduler
+// ─────────────────────────────────────────────────────────────────────────────
 
 let schedulerRunning = false;
 
@@ -490,14 +506,12 @@ async function scheduler() {
       } else if (slot === 1) {
         mode = consolidationStuck ? MODE.EXPANSION : MODE.CONSOLIDATION;
         if (consolidationStuck) {
-          console.log(`[SCHEDULER] CONSOLIDATION estagnada (${state.metrics.consolidationStagnantCycles} ciclos) — redirecionando para EXPANSION`);
+          console.log(`[SCHEDULER] CONSOLIDATION estagnada — redirecionando para EXPANSION`);
           state.metrics.consolidationStagnantCycles = 0;
         }
       } else if (slot === 2) {
         mode = MODE.EXPANSION;
       } else if (slot === 3) {
-        // Alterna GRAMMAR e SELF_PLAY: GRAMMAR nas primeiras 20 iterações de idle,
-        // depois alterna 1:1 para não perder diversidade do self-play
         mode = (state.idleCycles < 20 || state.idleCycles % 2 === 1)
           ? MODE.GRAMMAR
           : MODE.SELF_PLAY;
@@ -520,6 +534,10 @@ async function scheduler() {
     schedulerRunning = false;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// runMode
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function runMode(mode, ctx = {}) {
   if (_trainLock) {
@@ -570,6 +588,9 @@ async function runMode(mode, ctx = {}) {
       state.metrics.trainCycles++;
       state.totalPairsTrained += pairs.length;
 
+      // Registra no histórico para o painel
+      pushLossHistory(normLoss, normAcc, mode);
+
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       const lossStr = isFiniteNum(normLoss) ? normLoss.toFixed(4) : 'n/a';
       const accStr  = isFiniteNum(normAcc)  ? (normAcc * 100).toFixed(1) + '%' : 'n/a';
@@ -578,9 +599,8 @@ async function runMode(mode, ctx = {}) {
       await markEpisodesAsQueued(episodes);
 
       if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
-        const withFirestore = (state.cycle % CONFIG.saveToFirestoreEveryN === 0);
-        await safeSave({ firestoreAlso: withFirestore });
-        if (withFirestore) console.log(`[SAVE] Checkpoint Firestore no ciclo ${state.cycle}`);
+        const withMeta = (state.cycle % CONFIG.saveMetaToFirestoreEveryN === 0);
+        await safeSave({ firestoreMetaAlso: withMeta });
       }
 
       state.modeHistory.push(mode);
@@ -595,23 +615,17 @@ async function runMode(mode, ctx = {}) {
         return;
       }
       pairs = graphSentencesToPairs(sentences, state.vocab);
-      // Cap: máx 2000 pares por ciclo — evita ciclos de 25min que bloqueiam o scheduler
       if (pairs.length > 2000) {
         shuffleArray(pairs);
         pairs = pairs.slice(0, 2000);
-        console.log(`${tag} [CONSOLIDATION] Pares limitados a 2000 (era ${pairs.length + 2000 - pairs.length})`);
       }
-      desc  = `${sentences.length} frases do grafo → ${pairs.length} pares (cap=2000)`;
+      desc = `${sentences.length} frases do grafo → ${pairs.length} pares (cap=2000)`;
       break;
     }
 
     case MODE.EXPANSION: {
-      const vocabBefore = state.vocab.size;
-
-      const ingestResult = await runDataIngestion(state.vocab, {
-        batchSize: 500,
-      });
-
+      const vocabBefore  = state.vocab.size;
+      const ingestResult = await runDataIngestion(state.vocab, { batchSize: 500 });
       pairs = ingestResult.pairs;
       desc  = `ingest (${ingestResult.sentences} frases) → ${pairs.length} pares`;
 
@@ -665,6 +679,9 @@ async function runMode(mode, ctx = {}) {
     state.metrics.trainCycles++;
     state.totalPairsTrained += pairs.length;
 
+    // Registra no histórico para o painel
+    pushLossHistory(normLoss, normAcc, mode);
+
     if (mode === MODE.CONSOLIDATION && isFiniteNum(normLoss)) {
       const prevLoss = state.metrics.consolidationLastLoss;
       if (prevLoss !== null && prevLoss !== undefined) {
@@ -687,8 +704,8 @@ async function runMode(mode, ctx = {}) {
     console.log(`${tag} ✓ ${desc} | loss=${lossStr} acc=${accStr} | ${elapsed}s`);
 
     if (state.cycle - state.lastSaveCycle >= CONFIG.saveEveryN) {
-      const withFirestore = (state.cycle % CONFIG.saveToFirestoreEveryN === 0);
-      await safeSave({ firestoreAlso: withFirestore });
+      const withMeta = (state.cycle % CONFIG.saveMetaToFirestoreEveryN === 0);
+      await safeSave({ firestoreMetaAlso: withMeta });
     }
   } else {
     console.log(`${tag} Nenhum dado disponível para ${mode}`);
@@ -696,6 +713,26 @@ async function runMode(mode, ctx = {}) {
 
   state.modeHistory.push(mode);
   if (state.modeHistory.length > 20) state.modeHistory.shift();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function pushLossHistory(loss, accuracy, mode) {
+  const isFiniteNum = v => typeof v === 'number' && isFinite(v) && !isNaN(v);
+  if (!isFiniteNum(loss)) return;
+
+  state.lossHistory.push({
+    cycle:    state.cycle,
+    loss:     parseFloat(loss.toFixed(4)),
+    accuracy: isFiniteNum(accuracy) ? parseFloat((accuracy * 100).toFixed(2)) : null,
+    mode,
+    ts:       Date.now(),
+  });
+
+  // Mantém só os últimos 200 pontos
+  if (state.lossHistory.length > 200) state.lossHistory.shift();
 }
 
 function extractMetrics(result) {
@@ -738,17 +775,15 @@ async function markEpisodesAsQueued(episodes) {
   try {
     const batch = state.db.batch();
     const now   = new Date().toISOString();
-
     for (const ep of episodes) {
       if (!ep.id) continue;
       const ref = state.db.collection('user_episodes').doc(ep.id);
       batch.set(ref, {
         queued_for_consolidation: true,
-        queued_at:                now,
-        trained_at:               now,
+        queued_at:  now,
+        trained_at: now,
       }, { merge: true });
     }
-
     await batch.commit();
     console.log(`[EPISODES] Marcados ${episodes.length} episódios como treinados`);
   } catch (err) {
@@ -805,7 +840,7 @@ async function reportStatus(mode) {
       metrics:          state.metrics,
       model_stats:      state.model.getStats(),
       generation_stats: state.generationStats,
-      model_version:    '2.3.1',
+      model_version:    '2.4.0',
     }, { merge: true });
   } catch (e) { /* não crítico */ }
 }
@@ -829,6 +864,10 @@ function startWatchdog() {
   }, 30_000);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Main
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function main() {
   await init();
   startHttpServer();
@@ -844,39 +883,28 @@ async function main() {
 
   process.on('SIGTERM', async () => {
     console.log('\n[WORKER] SIGTERM — iniciando shutdown com persistência...');
-
-    // Railway envia SIGTERM e aguarda até ~10s antes de SIGKILL.
-    // Deadline curto: 8s para não ser morto antes de salvar.
     const deadline = Date.now() + 8_000;
     while ((_trainLock || _saveLock) && Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 200));
     }
-    if (_trainLock) console.warn('[WORKER] Shutdown com trainLock ativo — salvando estado parcial.');
-    if (_saveLock)  console.warn('[WORKER] Shutdown com saveLock ativo.');
-
-    // Salva disco + Firestore obrigatoriamente no shutdown
-    // firestoreAlso=true garante persistência cross-deploy
-    await safeSave({ firestoreAlso: true });
-    console.log('[WORKER] ✓ Estado salvo no Firestore antes do shutdown.');
-
+    await safeSave({ firestoreMetaAlso: true });
+    console.log('[WORKER] ✓ Estado salvo antes do shutdown.');
     try {
       if (state.db) {
         await state.db.collection('akie_worker_status').doc('current').set({
-          status:        'stopped',
-          stopped_at:    new Date().toISOString(),
-          final_steps:   state.model?.trainSteps || 0,
-          final_cycle:   state.cycle,
+          status:      'stopped',
+          stopped_at:  new Date().toISOString(),
+          final_steps: state.model?.trainSteps || 0,
+          final_cycle: state.cycle,
         }, { merge: true });
       }
     } catch { /* ignora */ }
-
     process.exit(0);
   });
 
-  // SIGINT (Ctrl+C local) — mesma lógica de persistência
   process.on('SIGINT', async () => {
     console.log('\n[WORKER] SIGINT — salvando e encerrando...');
-    await safeSave({ firestoreAlso: true });
+    await safeSave({ firestoreMetaAlso: true });
     process.exit(0);
   });
 }
