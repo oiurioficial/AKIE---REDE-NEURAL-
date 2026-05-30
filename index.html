@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AKIE — Neural Monitor</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap');
+
+:root {
+  --bg:       #020408;
+  --surface:  #050d12;
+  --panel:    #070f15;
+  --border:   #0d2a1a;
+  --green:    #00ff88;
+  --green2:   #00cc6a;
+  --green-dim:#004422;
+  --amber:    #ffaa00;
+  --red:      #ff3355;
+  --cyan:     #00ccff;
+  --text:     #a0ffcc;
+  --muted:    #2a6645;
+  --mono:     'Share Tech Mono', monospace;
+  --display:  'Orbitron', monospace;
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* Scanlines overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,255,136,0.015) 2px,
+    rgba(0,255,136,0.015) 4px
+  );
+  pointer-events: none;
+  z-index: 1000;
+}
+
+/* Vignette */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(ellipse at center, transparent 60%, rgba(0,0,0,0.7) 100%);
+  pointer-events: none;
+  z-index: 999;
+}
+
+/* Header */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  position: relative;
+  overflow: hidden;
+}
+
+header::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--green), transparent);
+  animation: scanH 3s linear infinite;
+}
+
+@keyframes scanH {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.logo-icon {
+  width: 36px;
+  height: 36px;
+  border: 2px solid var(--green);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  animation: pulse-border 2s ease-in-out infinite;
+}
+
+@keyframes pulse-border {
+  0%, 100% { box-shadow: 0 0 8px var(--green); }
+  50%       { box-shadow: 0 0 20px var(--green), 0 0 40px rgba(0,255,136,0.3); }
+}
+
+.logo-icon::before {
+  content: '◈';
+  color: var(--green);
+  font-size: 1rem;
+}
+
+.logo-text {
+  font-family: var(--display);
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--green);
+  letter-spacing: 0.15em;
+}
+
+.logo-sub {
+  font-size: 0.6rem;
+  color: var(--muted);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+}
+
+.live-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.65rem;
+  color: var(--green);
+  letter-spacing: 0.1em;
+}
+
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: blink 1s step-start infinite;
+}
+
+@keyframes blink { 50% { opacity: 0; } }
+
+.clock {
+  font-family: var(--display);
+  font-size: 0.8rem;
+  color: var(--muted);
+  letter-spacing: 0.1em;
+}
+
+/* Main layout */
+main {
+  padding: 1.5rem;
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-rows: auto auto auto auto;
+  gap: 1rem;
+}
+
+/* Panel */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  position: relative;
+  overflow: hidden;
+}
+
+.panel::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--green-dim), transparent);
+}
+
+.panel-header {
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.panel-title {
+  font-size: 0.6rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.panel-tag {
+  font-size: 0.55rem;
+  color: var(--green-dim);
+  letter-spacing: 0.1em;
+}
+
+.panel-body {
+  padding: 1rem;
+}
+
+/* Status bar */
+.status-bar {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+}
+
+.stat-cell {
+  background: var(--panel);
+  padding: 1rem 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  position: relative;
+  overflow: hidden;
+  transition: background 0.2s;
+}
+
+.stat-cell:hover { background: var(--surface); }
+
+.stat-label {
+  font-size: 0.55rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.stat-value {
+  font-family: var(--display);
+  font-size: 1.6rem;
+  font-weight: 700;
+  color: var(--green);
+  line-height: 1;
+  transition: all 0.3s;
+}
+
+.stat-value.amber { color: var(--amber); }
+.stat-value.red   { color: var(--red); }
+.stat-value.cyan  { color: var(--cyan); }
+
+.stat-sub {
+  font-size: 0.6rem;
+  color: var(--muted);
+}
+
+.stat-bar {
+  position: absolute;
+  bottom: 0; left: 0;
+  height: 2px;
+  background: var(--green);
+  transition: width 0.5s ease;
+  box-shadow: 0 0 8px var(--green);
+}
+
+/* Chart */
+.chart-panel { grid-column: 1 / 3; }
+
+canvas#lossChart {
+  width: 100% !important;
+  display: block;
+}
+
+/* Process status */
+.process-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.process-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.process-name {
+  font-size: 0.75rem;
+  color: var(--text);
+}
+
+.process-status {
+  font-size: 0.65rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 0;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+
+.status-running {
+  color: var(--green);
+  border: 1px solid var(--green);
+  background: rgba(0,255,136,0.06);
+  animation: glow-green 2s ease-in-out infinite;
+}
+
+@keyframes glow-green {
+  0%, 100% { box-shadow: 0 0 4px rgba(0,255,136,0.3); }
+  50%       { box-shadow: 0 0 10px rgba(0,255,136,0.6); }
+}
+
+.status-stopped {
+  color: var(--red);
+  border: 1px solid var(--red);
+  background: rgba(255,51,85,0.06);
+}
+
+.status-unknown {
+  color: var(--muted);
+  border: 1px solid var(--muted);
+}
+
+/* Controls */
+.controls { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 1rem; }
+
+.btn {
+  padding: 0.6rem 1rem;
+  border: 1px solid;
+  background: transparent;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: all 0.15s;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.btn-green {
+  color: var(--green);
+  border-color: var(--green);
+}
+.btn-green:hover {
+  background: rgba(0,255,136,0.08);
+  box-shadow: 0 0 12px rgba(0,255,136,0.3);
+}
+
+.btn-red {
+  color: var(--red);
+  border-color: var(--red);
+}
+.btn-red:hover {
+  background: rgba(255,51,85,0.08);
+  box-shadow: 0 0 12px rgba(255,51,85,0.3);
+}
+
+.btn-amber {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+.btn-amber:hover {
+  background: rgba(255,170,0,0.08);
+  box-shadow: 0 0 12px rgba(255,170,0,0.3);
+}
+
+.btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+  box-shadow: none;
+}
+
+/* Log terminal */
+.log-panel { grid-column: 1 / -1; }
+
+.log-terminal {
+  background: #020808;
+  border: 1px solid var(--green-dim);
+  padding: 1rem;
+  height: 260px;
+  overflow-y: auto;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  position: relative;
+}
+
+.log-terminal::-webkit-scrollbar { width: 4px; }
+.log-terminal::-webkit-scrollbar-track { background: var(--bg); }
+.log-terminal::-webkit-scrollbar-thumb { background: var(--green-dim); }
+
+.log-line {
+  display: block;
+  padding: 0.1rem 0;
+  border-bottom: 1px solid rgba(0,255,136,0.03);
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn { from { opacity: 0; transform: translateX(-4px); } to { opacity: 1; } }
+
+.log-line.highlight {
+  color: var(--green);
+  text-shadow: 0 0 8px rgba(0,255,136,0.4);
+}
+
+.log-line.muted { color: var(--muted); }
+.log-line.error { color: var(--red); }
+.log-line.warn  { color: var(--amber); }
+
+.log-cursor::after {
+  content: '█';
+  animation: blink 1s step-start infinite;
+  color: var(--green);
+  margin-left: 2px;
+}
+
+/* Memory bar */
+.mem-bar-wrap {
+  margin-top: 0.75rem;
+}
+
+.mem-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.6rem;
+  color: var(--muted);
+  margin-bottom: 0.3rem;
+}
+
+.mem-bar {
+  height: 4px;
+  background: var(--green-dim);
+  position: relative;
+  overflow: hidden;
+}
+
+.mem-fill {
+  height: 100%;
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green);
+  transition: width 0.5s ease;
+}
+
+/* Progress epoch */
+.epoch-progress {
+  margin-top: 0.75rem;
+}
+
+.epoch-track {
+  display: flex;
+  gap: 4px;
+  margin-top: 0.5rem;
+}
+
+.epoch-dot {
+  height: 6px;
+  flex: 1;
+  background: var(--green-dim);
+  transition: background 0.3s;
+}
+
+.epoch-dot.done {
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green);
+}
+
+.epoch-dot.current {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+  animation: pulse-amber 1s ease-in-out infinite;
+}
+
+@keyframes pulse-amber {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.5; }
+}
+
+/* Refresh indicator */
+.refresh-bar {
+  position: fixed;
+  top: 0; left: 0;
+  height: 2px;
+  background: var(--green);
+  box-shadow: 0 0 8px var(--green);
+  transition: width 5s linear;
+  z-index: 2000;
+}
+
+/* Notification */
+.notif {
+  position: fixed;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  background: var(--panel);
+  border: 1px solid var(--green);
+  padding: 0.75rem 1.25rem;
+  font-size: 0.72rem;
+  color: var(--green);
+  z-index: 3000;
+  animation: slideIn 0.2s ease;
+  box-shadow: 0 0 20px rgba(0,255,136,0.2);
+}
+
+@keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+.completed-banner {
+  grid-column: 1 / -1;
+  background: rgba(0,255,136,0.06);
+  border: 1px solid var(--green);
+  padding: 1rem 1.5rem;
+  display: none;
+  align-items: center;
+  gap: 1rem;
+  box-shadow: 0 0 30px rgba(0,255,136,0.1);
+}
+
+.completed-banner.visible { display: flex; }
+
+.completed-banner h2 {
+  font-family: var(--display);
+  font-size: 0.9rem;
+  color: var(--green);
+  letter-spacing: 0.2em;
+}
+
+.completed-banner p {
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+</style>
+</head>
+<body>
+
+<div class="refresh-bar" id="refreshBar"></div>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon"></div>
+    <div>
+      <div class="logo-text">AKIE NEURAL MONITOR</div>
+      <div class="logo-sub">Training Oversight System v1.0</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="live-badge">
+      <div class="live-dot" id="liveDot"></div>
+      <span id="liveText">CONNECTING</span>
+    </div>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+</header>
+
+<main>
+
+  <!-- Completed banner -->
+  <div class="completed-banner" id="completedBanner">
+    <div style="font-size:1.5rem">◈</div>
+    <div>
+      <h2>PRÉ-TREINAMENTO CONCLUÍDO</h2>
+      <p>Execute: <code style="color:var(--green)">cp -r /data/akie_pretrained/* /opt/akie/model/ && pm2 start akie-worker</code></p>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="status-bar">
+    <div class="stat-cell">
+      <span class="stat-label">Epoch</span>
+      <span class="stat-value" id="statEpoch">--</span>
+      <span class="stat-sub" id="statEpochSub">de -- épocas</span>
+      <div class="stat-bar" id="epochBar" style="width:0%"></div>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-label">Step</span>
+      <span class="stat-value cyan" id="statStep">--</span>
+      <span class="stat-sub">iteração atual</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-label">Loss</span>
+      <span class="stat-value amber" id="statLoss">--</span>
+      <span class="stat-sub">quanto menor, melhor</span>
+    </div>
+    <div class="stat-cell">
+      <span class="stat-label">Accuracy</span>
+      <span class="stat-value" id="statAcc">--%</span>
+      <span class="stat-sub">acurácia atual</span>
+      <div class="stat-bar" id="accBar" style="width:0%; background:var(--cyan)"></div>
+    </div>
+  </div>
+
+  <!-- Chart -->
+  <div class="panel chart-panel">
+    <div class="panel-header">
+      <span class="panel-title">◈ Evolução do Loss</span>
+      <span class="panel-tag">LOSS CURVE</span>
+    </div>
+    <div class="panel-body" style="padding:0.5rem 1rem 1rem">
+      <canvas id="lossChart" height="180"></canvas>
+    </div>
+  </div>
+
+  <!-- Status + Controls -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">◈ Processos</span>
+      <span class="panel-tag">SYS STATUS</span>
+    </div>
+    <div class="panel-body">
+      <div class="process-grid">
+        <div class="process-item">
+          <span class="process-name">_akie_pretrain.js</span>
+          <span class="process-status status-unknown" id="pretrainStatus">CHECKING</span>
+        </div>
+        <div class="process-item">
+          <span class="process-name">akie-worker (PM2)</span>
+          <span class="process-status status-unknown" id="workerStatus">CHECKING</span>
+        </div>
+      </div>
+
+      <div class="mem-bar-wrap">
+        <div class="mem-label">
+          <span>RAM</span>
+          <span id="memText">-- / -- MB</span>
+        </div>
+        <div class="mem-bar"><div class="mem-fill" id="memFill" style="width:0%"></div></div>
+      </div>
+
+      <div class="mem-bar-wrap">
+        <div class="mem-label">
+          <span>CPU Load</span>
+          <span id="loadText">--</span>
+        </div>
+        <div class="mem-bar" style="margin-top:0.5rem">
+          <div class="mem-fill" id="loadFill" style="width:0%; background:var(--amber)"></div>
+        </div>
+      </div>
+
+      <div class="epoch-progress">
+        <div class="mem-label">
+          <span>Progresso das Epochs</span>
+        </div>
+        <div class="epoch-track" id="epochTrack"></div>
+      </div>
+
+      <div class="controls">
+        <button class="btn btn-red" id="btnStopPretrain" onclick="control('stop-pretrain')">
+          ⬛ Parar Pré-treino
+        </button>
+        <button class="btn btn-amber" id="btnRestartWorker" onclick="control('restart-worker')">
+          ↺ Reiniciar Worker
+        </button>
+        <button class="btn btn-green" id="btnStopWorker" onclick="control('stop-worker')">
+          ⬛ Parar Worker
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Log terminal -->
+  <div class="panel log-panel">
+    <div class="panel-header">
+      <span class="panel-title">◈ Log Terminal</span>
+      <span class="panel-tag" id="logCount">0 linhas</span>
+    </div>
+    <div class="panel-body" style="padding:0">
+      <div class="log-terminal" id="logTerminal">
+        <span class="log-line muted">Conectando ao servidor de monitoramento...</span>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const API = 'http://185.190.142.223:4242';
+const INTERVAL = 5000;
+
+// ---------------------------------------------------------------------------
+// Chart setup (canvas manual — sem dependências externas)
+// ---------------------------------------------------------------------------
+const canvas = document.getElementById('lossChart');
+const ctx    = canvas.getContext('2d');
+let chartData = { labels: [], values: [] };
+
+function drawChart() {
+  const W = canvas.offsetWidth;
+  const H = 180;
+  canvas.width  = W;
+  canvas.height = H;
+
+  const pad = { top: 20, right: 20, bottom: 30, left: 50 };
+  const iW  = W - pad.left - pad.right;
+  const iH  = H - pad.top  - pad.bottom;
+
+  ctx.clearRect(0, 0, W, H);
+
+  // Background
+  ctx.fillStyle = '#020808';
+  ctx.fillRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = '#0d2a1a';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = pad.top + (iH / 4) * i;
+    ctx.beginPath();
+    ctx.moveTo(pad.left, y);
+    ctx.lineTo(pad.left + iW, y);
+    ctx.stroke();
+  }
+
+  const data = chartData.values;
+  if (data.length < 2) {
+    ctx.fillStyle = '#2a6645';
+    ctx.font = '11px Share Tech Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('Aguardando dados...', W / 2, H / 2);
+    return;
+  }
+
+  const min  = Math.min(...data) * 0.95;
+  const max  = Math.max(...data) * 1.05;
+  const rng  = max - min || 1;
+
+  const toX = i => pad.left + (i / (data.length - 1)) * iW;
+  const toY = v => pad.top + iH - ((v - min) / rng) * iH;
+
+  // Y axis labels
+  ctx.fillStyle = '#2a6645';
+  ctx.font = '10px Share Tech Mono';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    const v = max - (rng / 4) * i;
+    const y = pad.top + (iH / 4) * i;
+    ctx.fillText(v.toFixed(2), pad.left - 6, y + 4);
+  }
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, pad.top, 0, pad.top + iH);
+  grad.addColorStop(0,   'rgba(0,255,136,0.25)');
+  grad.addColorStop(1,   'rgba(0,255,136,0)');
+
+  ctx.beginPath();
+  ctx.moveTo(toX(0), toY(data[0]));
+  for (let i = 1; i < data.length; i++) ctx.lineTo(toX(i), toY(data[i]));
+  ctx.lineTo(toX(data.length - 1), pad.top + iH);
+  ctx.lineTo(toX(0), pad.top + iH);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  ctx.moveTo(toX(0), toY(data[0]));
+  for (let i = 1; i < data.length; i++) ctx.lineTo(toX(i), toY(data[i]));
+  ctx.strokeStyle = '#00ff88';
+  ctx.lineWidth   = 2;
+  ctx.shadowBlur  = 8;
+  ctx.shadowColor = '#00ff88';
+  ctx.stroke();
+  ctx.shadowBlur  = 0;
+
+  // Last point
+  if (data.length > 0) {
+    const lx = toX(data.length - 1);
+    const ly = toY(data[data.length - 1]);
+    ctx.beginPath();
+    ctx.arc(lx, ly, 4, 0, Math.PI * 2);
+    ctx.fillStyle = '#00ff88';
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = '#00ff88';
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Epoch track render
+// ---------------------------------------------------------------------------
+function renderEpochTrack(current, total) {
+  const track = document.getElementById('epochTrack');
+  track.innerHTML = '';
+  for (let i = 1; i <= total; i++) {
+    const dot = document.createElement('div');
+    dot.className = 'epoch-dot';
+    if (i < current)  dot.classList.add('done');
+    if (i === current) dot.classList.add('current');
+    track.appendChild(dot);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Log render
+// ---------------------------------------------------------------------------
+function classifyLine(line) {
+  if (line.includes('loss=') && line.includes('acc=')) return 'highlight';
+  if (line.includes('CONCLUÍDO') || line.includes('Concluído')) return 'highlight';
+  if (line.includes('ERRO') || line.includes('Error') || line.includes('error')) return 'error';
+  if (line.includes('⚠') || line.includes('warn')) return 'warn';
+  if (line.includes('[PRETRAIN]') || line.includes('[GRAMMAR]') || line.includes('[AKIE]')) return 'highlight';
+  return 'muted';
+}
+
+function renderLogs(lines) {
+  const term = document.getElementById('logTerminal');
+  const wasBottom = term.scrollTop + term.clientHeight >= term.scrollHeight - 20;
+
+  term.innerHTML = '';
+  lines.forEach((line, i) => {
+    const span = document.createElement('span');
+    span.className = `log-line ${classifyLine(line)}`;
+    if (i === lines.length - 1) span.className += ' log-cursor';
+    span.textContent = '› ' + line;
+    term.appendChild(span);
+  });
+
+  document.getElementById('logCount').textContent = lines.length + ' linhas';
+  if (wasBottom) term.scrollTop = term.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Status badge helper
+// ---------------------------------------------------------------------------
+function statusBadge(el, running, text) {
+  el.className = 'process-status ' + (running ? 'status-running' : 'status-stopped');
+  el.textContent = text || (running ? 'RUNNING' : 'STOPPED');
+}
+
+// ---------------------------------------------------------------------------
+// Refresh bar animation
+// ---------------------------------------------------------------------------
+function animateRefreshBar() {
+  const bar = document.getElementById('refreshBar');
+  bar.style.transition = 'none';
+  bar.style.width = '0%';
+  setTimeout(() => {
+    bar.style.transition = `width ${INTERVAL}ms linear`;
+    bar.style.width = '100%';
+  }, 50);
+}
+
+// ---------------------------------------------------------------------------
+// Notification
+// ---------------------------------------------------------------------------
+function notify(msg) {
+  const n = document.createElement('div');
+  n.className = 'notif';
+  n.textContent = msg;
+  document.body.appendChild(n);
+  setTimeout(() => n.remove(), 3000);
+}
+
+// ---------------------------------------------------------------------------
+// Control
+// ---------------------------------------------------------------------------
+async function control(action) {
+  const labels = {
+    'stop-pretrain':  'Parando pré-treino...',
+    'restart-worker': 'Reiniciando worker...',
+    'stop-worker':    'Parando worker...',
+  };
+  notify('▶ ' + (labels[action] || action));
+
+  try {
+    const r = await fetch(`${API}/control`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    const d = await r.json();
+    notify(d.done ? '✓ Comando executado' : '✗ Falha no comando');
+    setTimeout(fetchAll, 1500);
+  } catch (e) {
+    notify('✗ Erro: ' + e.message);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fetch
+// ---------------------------------------------------------------------------
+async function fetchAll() {
+  // Live indicator
+  const liveDot  = document.getElementById('liveDot');
+  const liveText = document.getElementById('liveText');
+
+  try {
+    // Logs
+    const logsRes = await fetch(`${API}/logs`);
+    const logs    = await logsRes.json();
+
+    if (logs.ok) {
+      renderLogs(logs.raw || []);
+
+      // Update stats
+      if (logs.latest) {
+        const { epoch, step, loss, accuracy } = logs.latest;
+        const total = logs.totalEpochs || 10;
+
+        document.getElementById('statEpoch').textContent = epoch;
+        document.getElementById('statEpochSub').textContent = `de ${total} épocas`;
+        document.getElementById('statStep').textContent  = step;
+        document.getElementById('statLoss').textContent  = loss.toFixed(4);
+        document.getElementById('statAcc').textContent   = accuracy.toFixed(1) + '%';
+
+        document.getElementById('epochBar').style.width = Math.min((epoch / total) * 100, 100) + '%';
+        document.getElementById('accBar').style.width   = Math.min(accuracy, 100) + '%';
+
+        renderEpochTrack(epoch, total);
+
+        // Chart data
+        const parsed = logs.parsed || [];
+        chartData.labels = parsed.map((_, i) => i);
+        chartData.values = parsed.map(p => p.loss);
+        drawChart();
+      }
+
+      if (logs.completed) {
+        document.getElementById('completedBanner').classList.add('visible');
+      }
+    }
+
+    // Status
+    const statusRes = await fetch(`${API}/status`);
+    const status    = await statusRes.json();
+
+    if (status.ok) {
+      statusBadge(
+        document.getElementById('pretrainStatus'),
+        status.pretrain.running,
+        status.pretrain.running ? 'RUNNING' : 'STOPPED'
+      );
+
+      const wRunning = status.worker.status === 'online';
+      statusBadge(
+        document.getElementById('workerStatus'),
+        wRunning,
+        status.worker.status.toUpperCase()
+      );
+
+      // Memory
+      const { total, used } = status.memory;
+      const pct = total ? Math.round((used / total) * 100) : 0;
+      document.getElementById('memText').textContent = `${used} / ${total} MB`;
+      document.getElementById('memFill').style.width = pct + '%';
+
+      // Load
+      const load = status.load || 0;
+      document.getElementById('loadText').textContent = load.toFixed(2);
+      document.getElementById('loadFill').style.width = Math.min(load * 20, 100) + '%';
+    }
+
+    liveDot.style.background  = 'var(--green)';
+    liveText.textContent      = 'LIVE';
+    liveText.style.color      = 'var(--green)';
+
+  } catch (e) {
+    liveDot.style.background = 'var(--red)';
+    liveText.textContent     = 'OFFLINE';
+    liveText.style.color     = 'var(--red)';
+    document.getElementById('logTerminal').innerHTML =
+      `<span class="log-line error">✗ Não foi possível conectar em ${API}</span>
+       <span class="log-line muted">Verifique se o monitor.js está rodando no VPS.</span>
+       <span class="log-line muted">Execute: pm2 start monitor.js --name akie-monitor</span>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Clock
+// ---------------------------------------------------------------------------
+function updateClock() {
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    now.toLocaleTimeString('pt-BR', { hour12: false });
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+window.addEventListener('resize', drawChart);
+
+setInterval(updateClock, 1000);
+updateClock();
+
+fetchAll();
+animateRefreshBar();
+setInterval(() => { fetchAll(); animateRefreshBar(); }, INTERVAL);
+</script>
+</body>
+</html>
