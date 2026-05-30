@@ -339,7 +339,7 @@ async function trainEpoch(model, pairs, batchSize, epochNum) {
     if (steps % 50 === 0) {
       const loss = steps > 0 ? (totalLoss / steps).toFixed(4) : 'n/a';
       const acc  = steps > 0 ? ((totalAcc  / steps) * 100).toFixed(1) + '%' : 'n/a';
-      process.stdout.write(`\r[PRETRAIN] Epoch ${epochNum} | Step ${steps} | loss=${loss} acc=${acc}    `);
+      console.log(`[PRETRAIN] Epoch ${epochNum} | Step ${steps} | loss=${loss} acc=${acc}`);
     }
   }
 
