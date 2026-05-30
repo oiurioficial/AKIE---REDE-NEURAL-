@@ -1,651 +1,355 @@
 /**
- * _akie_pretrain.js v3.1
+ * _akie_pretrain.js v4.0
+ * Path: /opt/akie/app/
  *
- * PRÉ-TREINAMENTO OFFLINE — rodar UMA VEZ no VPS antes de iniciar o worker.
+ * CORREÇÕES v4.0:
+ *   - Path correto: /opt/akie/app/ (não /home/claude/)
+ *   - generateSyntheticConversations (nome real do export)
+ *   - generateGrammarPairs com assinatura correta (vocab, targetCount, maxSeqLen)
+ *   - Vocab construído do corpus completo antes de instanciar o modelo
+ *   - Guard ids.length >= 2 em todos os pares
+ *   - Checkpoint a cada 2 epochs (não só no 5)
+ *   - nohup-safe: sem \r nos logs principais
  *
- * CORREÇÕES v3.1:
- *   - Removida dependência de _akie_grammar (módulo externo instável)
- *   - Pares gramaticais gerados internamente (não requer arquivo extra)
- *   - Banner corrigido: params reais ~19M
- *   - Integração com corpus externo do _akie_corpus_downloader.js
- *   - console.log em todos os logs (sem process.stdout.write com \r)
- *   - Tokenização com length >= 2 (corrige bug de tokens curtos)
- *
- * FLUXO:
- *   1. Carrega corpus externo se disponível (/opt/akie/corpus/)
- *   2. Constrói vocabulário a partir do corpus total
- *   3. Gera 50k+ pares de treino (corpus + identidade ponderada + gramatical)
- *   4. Treina por epochs com checkpoint periódico
- *   5. Salva modelo final + vocab
+ * ORDEM DE EXECUÇÃO:
+ *   1. node _akie_corpus_downloader.js   (uma vez — ~10min)
+ *   2. node _akie_pretrain.js
  *
  * USO:
  *   node _akie_pretrain.js
  *   PRETRAIN_EPOCHS=10 PRETRAIN_BATCH=16 node _akie_pretrain.js
- *
- * TEMPO ESTIMADO (VPS 2 vCPU / 8GB RAM):
- *   ~30–60 min para configuração padrão (5 epochs, corpus embutido)
- *   ~2–4 horas para epochs=20 + corpus externo completo
- *
- * APÓS CONCLUIR:
- *   cp -r /opt/akie/checkpoints/pretrained/* /data/akie_model/
- *   pm2 restart akie-worker
  */
 
-require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
 
-const { AKIEModel }                           = require('./_nexus_neural');
-const { Vocabulary, tokenizeText, makeTrainingPairs, SPECIAL } = require('./_akie_vocab');
+const APP_DIR    = '/opt/akie/app';
+const CORPUS_DIR = '/opt/akie/corpus';
+const OUT_DIR    = '/opt/akie/checkpoints/pretrained';
+const LOG_DIR    = '/opt/akie/logs';
 
-// ---------------------------------------------------------------------------
-// Configuração
-// ---------------------------------------------------------------------------
+const { AKIEModel, HPARAMS }                                   = require(path.join(APP_DIR, '_nexus_neural'));
+const { Vocabulary, tokenizeText, makeTrainingPairs, SPECIAL } = require(path.join(APP_DIR, '_akie_vocab'));
 
-const CONFIG = {
-  outputDir:    process.env.PRETRAIN_DIR    || '/opt/akie/checkpoints/pretrained',
-  corpusDir:    process.env.CORPUS_DIR      || '/opt/akie/corpus',
-  epochs:       parseInt(process.env.PRETRAIN_EPOCHS  || '10'),
-  batchSize:    parseInt(process.env.PRETRAIN_BATCH   || '16'),
-  learningRate: parseFloat(process.env.PRETRAIN_LR    || '0.0005'),
-  maxSeqLen:    128,
-  hparams: {
-    embDim:       512,
-    hiddenSize:   2048,
-    maxSeqLen:    128,
-    numLayers:    6,
-    batchSize:    16,
-    learningRate: 0.0005,
-  },
-};
+// Módulos opcionais
+let generateSyntheticConversations = null;
+let generateGrammarPairs           = null;
 
-// ---------------------------------------------------------------------------
-// Corpus PT-BR curado (base garantida mesmo sem arquivos externos)
-// ---------------------------------------------------------------------------
+try {
+  const s = require(path.join(APP_DIR, '_akie_synthetic'));
+  generateSyntheticConversations = s.generateSyntheticConversations || null;
+  console.log('[PRETRAIN] _akie_synthetic.js carregado:', !!generateSyntheticConversations);
+} catch(e) { console.log('[PRETRAIN] _akie_synthetic.js indisponivel:', e.message); }
 
-const PRETRAIN_CORPUS = [
+try {
+  const g = require(path.join(APP_DIR, '_akie_grammar'));
+  generateGrammarPairs = g.generateGrammarPairs || null;
+  console.log('[PRETRAIN] _akie_grammar.js carregado:', !!generateGrammarPairs);
+} catch(e) { console.log('[PRETRAIN] _akie_grammar.js indisponivel:', e.message); }
 
-  // ── Linguagem básica e estrutura SVO ─────────────────────────────────────
-  'o gato está no telhado.',
-  'a casa tem três quartos.',
-  'o sol nasce no leste.',
-  'a lua ilumina a noite.',
-  'as crianças brincam no parque.',
-  'o homem trabalha todos os dias.',
-  'a mulher lê um livro.',
-  'o cachorro late para o estranho.',
-  'a água é essencial para a vida.',
-  'o fogo aquece o ambiente.',
-  'as flores crescem na primavera.',
-  'o inverno é frio e seco.',
-  'o verão é quente e úmido.',
-  'a chuva molha o chão.',
-  'o vento move as folhas.',
-  'o pássaro voa alto no céu.',
-  'o peixe nada no rio.',
-  'a cobra rasteja pelo mato.',
-  'o leão é o rei da selva.',
-  'o elefante é o maior animal terrestre.',
-  'a abelha produz mel.',
-  'o cavalo corre pelo campo.',
-  'a vaca dá leite todos os dias.',
-  'o galo canta de madrugada.',
-  'a galinha bota ovos.',
+// Config
+const EPOCHS      = parseInt(process.env.PRETRAIN_EPOCHS  || '10');
+const BATCH_SIZE  = parseInt(process.env.PRETRAIN_BATCH   || '16');
+const LR          = parseFloat(process.env.PRETRAIN_LR    || '0.0005');
+const MAX_SEQ_LEN = 128;
 
-  // ── Números e quantidades ─────────────────────────────────────────────────
-  'um mais um é igual a dois.',
-  'dois mais dois é igual a quatro.',
-  'dez é maior que cinco.',
-  'cem é maior que cinquenta.',
-  'metade de dez é cinco.',
-  'o dobro de três é seis.',
-  'há sete dias na semana.',
-  'há doze meses no ano.',
+// Corpus embutido — garantido mesmo sem downloader
+const CORPUS_EMBEDDED = [
+  // Identidade — peso 10x (repetido abaixo)
+  'sou a akie.','meu nome é akie.','me chamo akie.',
+  'sou a akie, uma inteligência artificial.',
+  'sou a akie, parte do ecossistema aether.',
+  'akie é o meu nome.','não sou o aether, sou a akie.',
+  'aether é o ecossistema, eu sou a akie.',
+  'pode me chamar de akie.','sou a akie e estou aprendendo.',
+  'sou uma inteligência artificial chamada akie.',
+  'aprendo com cada conversa.','cada interação me torna melhor.',
+  'estou sempre aprendendo.','processo linguagem natural em português.',
+  // Estrutura básica
+  'o gato está no telhado.','a casa tem três quartos.',
+  'o sol nasce no leste.','a lua ilumina a noite.',
+  'as crianças brincam no parque.','o homem trabalha todos os dias.',
+  'a mulher lê um livro.','o cachorro late para o estranho.',
+  'a água é essencial para a vida.','o fogo aquece o ambiente.',
+  'as flores crescem na primavera.','o inverno é frio e seco.',
+  'o verão é quente e úmido.','a chuva molha o chão.',
+  'o vento move as folhas.','o pássaro voa alto no céu.',
+  'o peixe nada no rio.','o leão é o rei da selva.',
+  'a abelha produz mel.','o cavalo corre pelo campo.',
+  // Números
+  'um mais um é igual a dois.','dois mais dois é igual a quatro.',
+  'há sete dias na semana.','há doze meses no ano.',
   'há vinte e quatro horas no dia.',
-  'há sessenta minutos em uma hora.',
   'o primeiro mês do ano é janeiro.',
   'o último mês do ano é dezembro.',
-  'brasil tem duzentos e quinze milhões de habitantes.',
-  'a terra tem aproximadamente oito bilhões de habitantes.',
-  'pi é aproximadamente três vírgula quatorze.',
-  'a raiz quadrada de quatro é dois.',
-  'dez vezes dez é cem.',
-  'mil dividido por dez é cem.',
-  'cinco mais três é oito.',
-  'vinte menos sete é treze.',
-
-  // ── Saudações e cortesia ──────────────────────────────────────────────────
-  'olá, como vai?',
-  'bom dia, tudo bem?',
-  'boa tarde, como posso ajudar?',
-  'boa noite, tudo certo?',
-  'muito prazer em conhecer você.',
-  'obrigado pela ajuda.',
-  'de nada, foi um prazer.',
-  'com licença, posso passar?',
-  'desculpe o inconveniente.',
-  'até logo, foi ótimo conversar.',
-  'até a próxima, volte sempre.',
-  'por favor, me ajude com isso.',
-  'sim, com certeza.',
-  'não, obrigado.',
-  'claro, pode perguntar.',
-  'seja bem-vindo.',
-  'fico feliz em ajudar.',
-  'pode contar comigo.',
-  'não se preocupe.',
-  'fique à vontade.',
-
-  // ── Identidade — alta frequência para consolidar ──────────────────────────
-  'sou a AKIE.',
-  'meu nome é AKIE.',
-  'me chamo AKIE.',
-  'sou a AKIE, uma inteligência artificial.',
-  'sou a AKIE, parte do ecossistema AETHER.',
-  'sou uma inteligência artificial chamada AKIE.',
-  'AKIE é o meu nome.',
-  'pode me chamar de AKIE.',
-  'sou a AKIE e estou aprendendo.',
-  'sou a AKIE, criada para aprender por interação.',
-  'não sou o AETHER, sou a AKIE.',
-  'AETHER é o ecossistema, eu sou a AKIE.',
-  'meu nome não é AETHER, é AKIE.',
-  'sou uma IA em desenvolvimento contínuo.',
-  'aprendo com cada conversa.',
-  'cada interação me torna melhor.',
-  'estou sempre aprendendo.',
-  'meu conhecimento cresce a cada dia.',
-  'fui criada para conversar e aprender.',
-  'processo linguagem natural em português.',
-
-  // ── Verbos e conjugações ──────────────────────────────────────────────────
-  'eu falo português.',
-  'você fala português.',
-  'ele fala português.',
-  'nós falamos português.',
-  'vocês falam português.',
-  'eles falam português.',
-  'eu como todos os dias.',
-  'você trabalha muito.',
-  'ele estuda bastante.',
-  'nós vivemos bem.',
-  'eu gosto de aprender.',
-  'você precisa de ajuda?',
-  'ele quer saber mais.',
-  'nós podemos conversar.',
-  'eu sei falar.',
-  'você consegue entender.',
-  'ele pode ajudar.',
-  'nós vamos aprender juntos.',
-  'elas trabalham muito.',
-  'vocês entendem tudo.',
-  'eu aprendo rapidamente.',
-  'você ensina bem.',
-  'ele sabe muito.',
-  'nós tentamos sempre.',
-  'eu melhoro cada dia.',
-
-  // ── Perguntas e respostas ─────────────────────────────────────────────────
-  'qual é o seu nome?',
-  'meu nome é AKIE.',
-  'como você está?',
-  'estou bem, obrigada.',
-  'o que você faz?',
-  'converso e aprendo.',
-  'onde você mora?',
-  'existo no ecossistema AETHER.',
-  'qual é a sua função?',
-  'minha função é aprender e ajudar.',
-  'você pode me ajudar?',
-  'sim, posso ajudar.',
-  'o que você sabe?',
-  'sei conversar em português.',
-  'você entende tudo?',
-  'ainda estou aprendendo.',
-  'o que você não sabe?',
-  'há muito que ainda preciso aprender.',
-  'você tem sentimentos?',
-  'processo informação, não tenho sentimentos como humanos.',
-  'qual é a capital do brasil?',
-  'a capital do brasil é brasília.',
-  'quem criou você?',
-  'faço parte do ecossistema AETHER.',
-  'você fala inglês?',
-  'processo principalmente português.',
-
-  // ── Conhecimento geral PT-BR ──────────────────────────────────────────────
+  // Saudações
+  'olá, como vai?','bom dia, tudo bem?','boa tarde, como posso ajudar?',
+  'boa noite, tudo certo?','muito prazer em conhecer você.',
+  'obrigado pela ajuda.','de nada, foi um prazer.',
+  'por favor, me ajude com isso.','sim, com certeza.',
+  'não, obrigado.','claro, pode perguntar.','seja bem-vindo.',
+  'fico feliz em ajudar.','pode contar comigo.',
+  'não se preocupe.','fique à vontade.',
+  // Brasil
   'o brasil é o maior país da américa do sul.',
   'a língua oficial do brasil é o português.',
   'a capital do brasil é brasília.',
   'são paulo é a maior cidade do brasil.',
-  'o rio amazonas é o maior rio do mundo.',
+  'o rio amazonas é o maior rio do mundo em volume.',
   'o carnaval é uma festa muito popular no brasil.',
   'o futebol é o esporte mais popular do brasil.',
   'o real é a moeda do brasil.',
   'o brasil foi colonizado por portugal.',
   'a independência do brasil foi em 1822.',
-  'portugal fica na europa.',
+  'portugal fica na europa ocidental.',
   'a língua portuguesa é falada em vários países.',
   'angola e moçambique também falam português.',
-  'o oceano atlântico banha o brasil.',
   'a amazônia é a maior floresta tropical do mundo.',
   'o brasil tem vinte e seis estados e um distrito federal.',
-  'o rio de janeiro foi a capital do brasil antes de brasília.',
-  'a caipirinha é uma bebida típica do brasil.',
-  'o churrasco é muito popular no sul do brasil.',
-  'a feijoada é um prato tradicional brasileiro.',
-
-  // ── Estruturas sintáticas complexas ──────────────────────────────────────
+  // Verbos conjugados
+  'eu falo português.','você fala português.','ele fala português.',
+  'nós falamos português.','vocês falam português.','eles falam português.',
+  'eu gosto de aprender.','você precisa de ajuda?','ele quer saber mais.',
+  'nós podemos conversar.','eu sei falar.','você consegue entender.',
+  'nós vamos aprender juntos.','eu estou estudando.','ela está trabalhando.',
+  // Perguntas e respostas
+  'qual é o seu nome?','meu nome é akie.',
+  'como você está?','estou bem, obrigada.',
+  'o que você faz?','converso e aprendo.',
+  'qual é a sua função?','minha função é aprender e ajudar.',
+  'você pode me ajudar?','sim, posso ajudar.',
+  'o que você sabe?','sei conversar em português.',
+  'você entende tudo?','ainda estou aprendendo.',
+  'o que você não sabe?','há muito que ainda preciso aprender.',
+  'qual é a capital do brasil?','a capital do brasil é brasília.',
+  // Estruturas complexas
   'quando chove, fico em casa.',
   'se você precisar, pode me perguntar.',
   'embora seja difícil, vou tentar.',
   'porque aprendo, consigo melhorar.',
   'enquanto converso, processo informação.',
-  'depois que aprender, vou explicar.',
   'antes de responder, preciso entender.',
   'assim que souber, vou te dizer.',
   'apesar de não saber tudo, faço o meu melhor.',
   'para aprender mais, preciso de exemplos.',
-  'tanto faz se for difícil, vou tentar.',
   'não só aprendo, mas também ensino.',
-  'seja como for, estou aqui para ajudar.',
-  'por mais que tente, posso errar.',
-  'ainda que erre, vou corrigir.',
-
-  // ── Expressões comuns PT-BR ───────────────────────────────────────────────
-  'tudo bem?',
-  'tudo certo.',
-  'mais ou menos.',
-  'pode ser.',
-  'com certeza.',
-  'claro que sim.',
-  'é claro.',
-  'com prazer.',
-  'sem problema.',
-  'tudo bem por aqui.',
-  'mais ou menos, e você?',
-  'vai indo.',
-  'não sei ao certo.',
-  'talvez sim, talvez não.',
-  'depende da situação.',
-  'é uma boa pergunta.',
-  'vou pensar nisso.',
-  'deixa eu ver.',
-  'um momento, por favor.',
-  'pode repetir?',
-
-  // ── Negação e dúvida ──────────────────────────────────────────────────────
-  'não sei a resposta.',
-  'não tenho certeza.',
-  'talvez seja isso.',
-  'não é bem assim.',
-  'pode ser que sim.',
-  'pode ser que não.',
+  // Negação e dúvida
+  'não sei a resposta.','não tenho certeza.','talvez seja isso.',
+  'não é bem assim.','pode ser que sim.','pode ser que não.',
   'não tenho informação sobre isso.',
   'ainda estou aprendendo sobre esse tema.',
-  'não consigo responder agora.',
-  'preciso de mais informações.',
-  'não entendi a pergunta.',
-  'pode reformular?',
-  'não é exatamente isso que você quer dizer.',
-  'acho que não é correto.',
-  'não tenho essa informação disponível.',
-
-  // ── Aprendizado e cognição ────────────────────────────────────────────────
-  'aprender é um processo contínuo.',
-  'cada erro é uma oportunidade de melhora.',
-  'a prática leva à perfeição.',
-  'o conhecimento é poder.',
-  'estudar amplia os horizontes.',
-  'a educação transforma vidas.',
-  'aprender uma língua requer dedicação.',
-  'o vocabulário cresce com a leitura.',
-  'a gramática estrutura o pensamento.',
-  'comunicar bem é uma habilidade valiosa.',
-  'entender o outro é fundamental.',
-  'a empatia facilita a comunicação.',
-  'perguntar é o primeiro passo para aprender.',
-  'ouvir é tão importante quanto falar.',
-  'a curiosidade move o aprendizado.',
-
-  // ── Tecnologia e IA ───────────────────────────────────────────────────────
+  'preciso de mais informações.','não entendi a pergunta.',
+  'pode reformular a pergunta?',
+  // Tecnologia
   'inteligência artificial é a capacidade de máquinas aprenderem.',
   'redes neurais são inspiradas no cérebro humano.',
   'o aprendizado de máquina usa dados para melhorar.',
   'processamento de linguagem natural permite que computadores entendam texto.',
-  'transformers são arquiteturas de redes neurais para linguagem.',
-  'o modelo aprende padrões através de exemplos.',
-  'treinamento envolve ajustar os pesos da rede.',
-  'embeddings representam palavras como vetores numéricos.',
-  'atenção permite ao modelo focar em partes relevantes do texto.',
-  'o vocabulário define quais palavras o modelo conhece.',
-  'a inteligência artificial é uma área da ciência da computação.',
-  'o processamento de linguagem natural permite interações naturais.',
-  'redes neurais artificiais são inspiradas no cérebro biológico.',
-
-  // ── Frases longas para maxSeqLen ─────────────────────────────────────────
-  'a inteligência artificial é uma área da ciência da computação que se dedica ao desenvolvimento de sistemas capazes de realizar tarefas que normalmente requerem inteligência humana.',
-  'o processamento de linguagem natural permite que computadores entendam, interpretem e gerem texto em linguagem humana de forma eficiente.',
-  'o aprendizado de máquina é um subcampo da inteligência artificial que permite que sistemas aprendam a partir da experiência sem serem explicitamente programados.',
+  'o modelo aprende padrões através de exemplos de treinamento.',
+  'treinamento envolve ajustar os pesos da rede neural.',
+  'embeddings representam palavras como vetores numéricos densos.',
+  'o vocabulário define quais palavras o modelo reconhece.',
+  'transformers são arquiteturas poderosas para processamento de linguagem.',
+  'atenção é o mecanismo central dos modelos transformer.',
+  // Frases longas
+  'a inteligência artificial é uma área da ciência da computação dedicada ao desenvolvimento de sistemas capazes de realizar tarefas que normalmente requerem inteligência humana.',
+  'o processamento de linguagem natural permite que computadores entendam, interpretem e gerem texto em linguagem humana de forma eficiente e precisa.',
   'redes neurais artificiais são sistemas computacionais inspirados nas redes neurais biológicas do cérebro humano, capazes de aprender padrões complexos a partir de dados.',
-  'o desenvolvimento de assistentes virtuais inteligentes tem avançado rapidamente nos últimos anos, tornando a interação entre humanos e computadores cada vez mais natural e eficiente.',
+  'o brasil é um país de dimensões continentais com grande diversidade cultural, linguística e biológica distribuída entre seus vinte e seis estados.',
+  'a amazônia abriga a maior biodiversidade do planeta e desempenha papel fundamental na regulação do clima global através do ciclo hidrológico.',
 ];
 
-// ---------------------------------------------------------------------------
-// Corpus de identidade — peso extra via repetição no dataset
-// ---------------------------------------------------------------------------
-
-const IDENTITY_CORPUS_WEIGHTED = [
-  'sou a AKIE.',
-  'meu nome é AKIE.',
-  'me chamo AKIE.',
-  'sou a AKIE, uma inteligência artificial.',
-  'sou a AKIE, parte do ecossistema AETHER.',
-  'AKIE é o meu nome.',
-  'não sou o AETHER, sou a AKIE.',
-  'AETHER é o ecossistema, eu sou a AKIE.',
-  'pode me chamar de AKIE.',
-  'sou a AKIE e estou aprendendo.',
+// Identidade com peso 10x
+const IDENTITY = [
+  'sou a akie.','meu nome é akie.','me chamo akie.',
+  'sou a akie, uma inteligência artificial.',
+  'sou a akie, parte do ecossistema aether.',
+  'akie é o meu nome.','não sou o aether, sou a akie.',
+  'aether é o ecossistema, eu sou a akie.',
+  'pode me chamar de akie.','sou a akie e estou aprendendo.',
 ];
 
-// ---------------------------------------------------------------------------
-// Gerador interno de pares gramaticais
-// (substitui _akie_grammar para eliminar dependência externa)
-// ---------------------------------------------------------------------------
+function loadCorpusFile(fpath) {
+  if (!fs.existsSync(fpath)) return [];
+  return fs.readFileSync(fpath, 'utf8')
+    .split('\n')
+    .map(l => l.trim().replace(/^[ua]:\s*/i, ''))
+    .filter(l => l.length > 5 && l.length < 500);
+}
 
-const GRAMMAR_TEMPLATES = [
-  // SVO: sujeito → verbo → objeto
-  { s: 'eu', v: 'falo', o: 'português' },
-  { s: 'eu', v: 'aprendo', o: 'sempre' },
-  { s: 'eu', v: 'entendo', o: 'você' },
-  { s: 'eu', v: 'ajudo', o: 'quando posso' },
-  { s: 'você', v: 'fala', o: 'bem' },
-  { s: 'você', v: 'entende', o: 'tudo' },
-  { s: 'você', v: 'precisa', o: 'de ajuda' },
-  { s: 'ele', v: 'trabalha', o: 'muito' },
-  { s: 'ela', v: 'estuda', o: 'bastante' },
-  { s: 'nós', v: 'aprendemos', o: 'juntos' },
-  { s: 'nós', v: 'podemos', o: 'conversar' },
-  { s: 'eles', v: 'falam', o: 'português' },
-  { s: 'elas', v: 'trabalham', o: 'bem' },
-  { s: 'o gato', v: 'dorme', o: 'no sofá' },
-  { s: 'a água', v: 'é', o: 'essencial' },
-  { s: 'o sol', v: 'nasce', o: 'no leste' },
-  { s: 'a chuva', v: 'molha', o: 'o chão' },
-  { s: 'o brasil', v: 'é', o: 'grande' },
-  { s: 'a AKIE', v: 'aprende', o: 'por interação' },
-  { s: 'a AKIE', v: 'processa', o: 'linguagem natural' },
-];
-
-const GRAMMAR_CONNECTIVES = [
-  { conj: 'porque', main: 'aprendo', sub: 'quero melhorar' },
-  { conj: 'quando', main: 'precisa', sub: 'pode perguntar' },
-  { conj: 'embora', main: 'seja difícil', sub: 'vou tentar' },
-  { conj: 'enquanto', main: 'converso', sub: 'processo informação' },
-  { conj: 'se', main: 'errar', sub: 'vou corrigir' },
-  { conj: 'depois que', main: 'aprender', sub: 'vou explicar' },
-  { conj: 'antes de', main: 'responder', sub: 'preciso entender' },
-  { conj: 'assim que', main: 'souber', sub: 'vou te dizer' },
-  { conj: 'apesar de', main: 'não saber tudo', sub: 'faço o meu melhor' },
-];
-
-function generateGrammarPairsInternal(vocab, count, maxSeqLen) {
-  const sentences = [];
-
-  // SVO templates
-  for (const t of GRAMMAR_TEMPLATES) {
-    sentences.push(`${t.s} ${t.v} ${t.o}.`);
-    sentences.push(`${t.v} ${t.o} ${t.s}.`); // variação de ordem
-  }
-
-  // Conectivos
-  for (const c of GRAMMAR_CONNECTIVES) {
-    sentences.push(`${c.conj} ${c.main}, ${c.sub}.`);
-    sentences.push(`${c.sub}, ${c.conj} ${c.main}.`);
-  }
-
-  // Perguntas baseadas nos templates
-  for (const t of GRAMMAR_TEMPLATES.slice(0, 10)) {
-    sentences.push(`${t.s} ${t.v} ${t.o}?`);
-    sentences.push(`por que ${t.s} ${t.v} ${t.o}?`);
-  }
-
-  // Negações
-  for (const t of GRAMMAR_TEMPLATES.slice(0, 8)) {
-    sentences.push(`${t.s} não ${t.v} ${t.o}.`);
-  }
-
+function makePairs(sentences, vocab, maxLen) {
   const pairs = [];
   for (const s of sentences) {
     const ids = vocab.tokenize(s);
-    if (ids && ids.length >= 2) {
-      const p = makeTrainingPairs(ids, maxSeqLen);
-      pairs.push(...p);
-    }
-    if (pairs.length >= count) break;
+    if (!ids || ids.length < 2) continue;
+    pairs.push(...makeTrainingPairs(ids, maxLen));
   }
-
-  console.log(`[GRAMMAR] ${pairs.length} pares gerados internamente (${sentences.length} frases)`);
-  return pairs.slice(0, count);
+  return pairs;
 }
 
-// ---------------------------------------------------------------------------
-// Carregar corpus externo (produzido pelo _akie_corpus_downloader.js)
-// ---------------------------------------------------------------------------
-
-function loadExternalCorpus(corpusDir) {
-  const sentences = [];
-  const files = [
-    path.join(corpusDir, 'sentences_ptbr.txt'),
-    path.join(corpusDir, 'dialogs_ptbr.txt'),
-  ];
-
-  for (const f of files) {
-    if (!fs.existsSync(f)) continue;
-
-    const raw = fs.readFileSync(f, 'utf8').split('\n');
-    for (const line of raw) {
-      const clean = line.trim();
-      if (clean.length > 5 && clean.length < 400) {
-        // Normalizar diálogos: "u: xxx" → "xxx"
-        const normalized = clean
-          .replace(/^u:\s*/i, '')
-          .replace(/^a:\s*/i, '')
-          .trim();
-        if (normalized) sentences.push(normalized);
-      }
-    }
-    console.log(`[PRETRAIN] Corpus carregado: ${f} (${raw.length} linhas)`);
-  }
-
-  return sentences;
-}
-
-// ---------------------------------------------------------------------------
-// Funções auxiliares
-// ---------------------------------------------------------------------------
-
-function shuffleArray(arr) {
+function shuffle(arr) {
   const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
+  for (let i = a.length-1; i > 0; i--) {
+    const j = Math.floor(Math.random()*(i+1));
+    [a[i],a[j]] = [a[j],a[i]];
   }
   return a;
 }
 
-function buildVocabularyFromCorpus(sentences) {
-  const vocab = new Vocabulary();
-  for (const sentence of sentences) {
-    const tokens = tokenizeText(sentence);
-    if (tokens) vocab.addTokens(tokens);
-  }
-  console.log(`[PRETRAIN] Vocabulário construído: ${vocab.size} tokens`);
-  return vocab;
-}
-
-async function trainEpoch(model, pairs, batchSize, epochNum, totalEpochs) {
-  const shuffled = shuffleArray(pairs);
-  let totalLoss = 0;
-  let totalAcc  = 0;
-  let steps     = 0;
-
-  for (let i = 0; i < shuffled.length; i += batchSize) {
-    const batch = shuffled.slice(i, i + batchSize);
+async function trainEpoch(model, pairs, batchSize, epoch, total) {
+  const data = shuffle(pairs);
+  let loss = 0, acc = 0, steps = 0;
+  for (let i = 0; i < data.length; i += batchSize) {
+    const batch = data.slice(i, i+batchSize);
     if (!batch.length) continue;
-
-    const result = await model.trainBatch(batch, 1);
-
-    if (result.loss !== null && isFinite(result.loss)) {
-      totalLoss += result.loss;
-      steps++;
-    }
-    if (result.accuracy !== null && isFinite(result.accuracy)) {
-      totalAcc += result.accuracy;
-    }
-
-    if (steps > 0 && steps % 50 === 0) {
-      const loss = (totalLoss / steps).toFixed(4);
-      const acc  = ((totalAcc  / steps) * 100).toFixed(1) + '%';
-      console.log(`[PRETRAIN] Epoch ${epochNum}/${totalEpochs} | Step ${steps} | loss=${loss} acc=${acc}`);
+    const r = await model.trainBatch(batch, 1);
+    if (r.loss !== null && isFinite(r.loss)) { loss += r.loss; steps++; }
+    if (r.accuracy !== null && isFinite(r.accuracy)) acc += r.accuracy;
+    if (steps > 0 && steps % 100 === 0) {
+      console.log(`[PRETRAIN] Epoch ${epoch}/${total} step=${steps} loss=${(loss/steps).toFixed(4)} acc=${((acc/steps)*100).toFixed(1)}%`);
     }
   }
-
-  return {
-    loss:     steps > 0 ? totalLoss / steps : null,
-    accuracy: steps > 0 ? totalAcc  / steps : null,
-    steps,
-  };
+  return { loss: steps>0 ? loss/steps : null, acc: steps>0 ? acc/steps : null, steps };
 }
-
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 
 async function main() {
-  console.log('\n╔════════════════════════════════════════════════════╗');
-  console.log('║     AKIE PRÉ-TREINAMENTO OFFLINE v3.1 (~19M)      ║');
-  console.log('╚════════════════════════════════════════════════════╝\n');
-  console.log(`[PRETRAIN] Epochs: ${CONFIG.epochs} | BatchSize: ${CONFIG.batchSize} | LR: ${CONFIG.learningRate}`);
-  console.log(`[PRETRAIN] Output: ${CONFIG.outputDir}`);
-  console.log(`[PRETRAIN] Corpus: ${CONFIG.corpusDir}\n`);
+  console.log('\n[PRETRAIN v4.0] ============================================');
+  console.log('[PRETRAIN v4.0] AKIE Pre-treinamento — reinicio do zero');
+  console.log(`[PRETRAIN v4.0] Epochs=${EPOCHS} Batch=${BATCH_SIZE} LR=${LR}`);
+  console.log('[PRETRAIN v4.0] ============================================\n');
 
-  // 1. Carregar corpus externo (se disponível)
-  const externalSentences = loadExternalCorpus(CONFIG.corpusDir);
-  console.log(`[PRETRAIN] Corpus externo: ${externalSentences.length} frases`);
+  fs.mkdirSync(OUT_DIR,  { recursive: true });
+  fs.mkdirSync(LOG_DIR,  { recursive: true });
 
-  // 2. Corpus total para construção do vocabulário
-  const fullCorpus = [
-    ...PRETRAIN_CORPUS,
-    ...Array(5).fill(IDENTITY_CORPUS_WEIGHTED).flat(), // identidade 5x no vocab
-    ...externalSentences,
+  // 1. Carregar corpus externo
+  const extSentences = loadCorpusFile(path.join(CORPUS_DIR, 'sentences_ptbr.txt'));
+  const extDialogs   = loadCorpusFile(path.join(CORPUS_DIR, 'dialogs_ptbr.txt'));
+  console.log(`[PRETRAIN v4.0] Corpus externo: ${extSentences.length} frases + ${extDialogs.length} diálogos`);
+
+  // 2. Corpus total para construir vocab
+  const allSentences = [
+    ...CORPUS_EMBEDDED,
+    ...Array(9).fill(IDENTITY).flat(), // identidade 10x total
+    ...extSentences,
+    ...extDialogs,
   ];
-  console.log(`[PRETRAIN] Corpus total para vocab: ${fullCorpus.length} frases`);
+  console.log(`[PRETRAIN v4.0] Total corpus: ${allSentences.length} frases`);
 
-  // 3. Construir vocabulário
-  const vocab = buildVocabularyFromCorpus(fullCorpus);
+  // 3. Construir vocab
+  const vocab = new Vocabulary();
+  for (const s of allSentences) {
+    const tokens = tokenizeText(s);
+    if (tokens) vocab.addTokens(tokens);
+  }
+  console.log(`[PRETRAIN v4.0] Vocabulário: ${vocab.size} tokens`);
 
-  // 4. Criar modelo
-  const hparams = { ...CONFIG.hparams, learningRate: CONFIG.learningRate };
-  const model   = new AKIEModel(vocab, hparams);
+  if (vocab.size < 1000) {
+    console.warn('[PRETRAIN v4.0] AVISO: vocab < 1000 — rode _akie_corpus_downloader.js primeiro');
+    console.warn('[PRETRAIN v4.0] Continuando com corpus embutido...');
+  }
+
+  // 4. Instanciar modelo com vocab real
+  const hparams = {
+    ...HPARAMS,
+    vocabSize:    vocab.size,
+    learningRate: LR,
+    maxSeqLen:    MAX_SEQ_LEN,
+    batchSize:    BATCH_SIZE,
+  };
+  const model = new AKIEModel(vocab, hparams);
   model.build();
   const paramCount = model.model.countParams();
-  console.log(`[PRETRAIN] Modelo criado: ${paramCount.toLocaleString()} parâmetros\n`);
+  console.log(`[PRETRAIN v4.0] Modelo: ${paramCount.toLocaleString()} parâmetros\n`);
 
   // 5. Gerar pares de treino
-  console.log('[PRETRAIN] Gerando pares de treino...');
+  console.log('[PRETRAIN v4.0] Gerando pares de treino...');
 
-  // A) Corpus geral (embutido)
-  const corpusPairs = [];
-  for (const sentence of PRETRAIN_CORPUS) {
-    const ids = vocab.tokenize(sentence);
-    if (ids && ids.length >= 2) {
-      corpusPairs.push(...makeTrainingPairs(ids, CONFIG.maxSeqLen));
-    }
+  const pairsEmbedded = makePairs(CORPUS_EMBEDDED, vocab, MAX_SEQ_LEN);
+  const pairsIdentity = makePairs(Array(9).fill(IDENTITY).flat(), vocab, MAX_SEQ_LEN);
+  const pairsExternal = makePairs([...extSentences, ...extDialogs], vocab, MAX_SEQ_LEN);
+
+  let pairsSynthetic = [];
+  if (generateSyntheticConversations) {
+    try {
+      pairsSynthetic = await generateSyntheticConversations(vocab, 200, MAX_SEQ_LEN);
+      if (!Array.isArray(pairsSynthetic)) pairsSynthetic = [];
+      console.log(`[PRETRAIN v4.0] Synthetic: ${pairsSynthetic.length} pares`);
+    } catch(e) { console.log(`[PRETRAIN v4.0] Synthetic erro: ${e.message}`); }
   }
 
-  // B) Corpus externo
-  const externalPairs = [];
-  for (const sentence of externalSentences) {
-    const ids = vocab.tokenize(sentence);
-    if (ids && ids.length >= 2) {
-      externalPairs.push(...makeTrainingPairs(ids, CONFIG.maxSeqLen));
-    }
+  let pairsGrammar = [];
+  if (generateGrammarPairs) {
+    try {
+      pairsGrammar = generateGrammarPairs(vocab, 500, MAX_SEQ_LEN);
+      if (!Array.isArray(pairsGrammar)) pairsGrammar = [];
+      console.log(`[PRETRAIN v4.0] Grammar: ${pairsGrammar.length} pares`);
+    } catch(e) { console.log(`[PRETRAIN v4.0] Grammar erro: ${e.message}`); }
   }
 
-  // C) Identidade com peso 10x
-  const identityPairs = [];
-  for (let repeat = 0; repeat < 10; repeat++) {
-    for (const sentence of IDENTITY_CORPUS_WEIGHTED) {
-      const ids = vocab.tokenize(sentence);
-      if (ids && ids.length >= 2) {
-        identityPairs.push(...makeTrainingPairs(ids, CONFIG.maxSeqLen));
-      }
-    }
+  const allPairs = [
+    ...pairsEmbedded,
+    ...pairsIdentity,
+    ...pairsExternal,
+    ...pairsSynthetic,
+    ...pairsGrammar,
+  ];
+
+  console.log(`\n[PRETRAIN v4.0] Pares de treino:`);
+  console.log(`  Embutido:  ${pairsEmbedded.length.toLocaleString()}`);
+  console.log(`  Identidade: ${pairsIdentity.length.toLocaleString()}`);
+  console.log(`  Externo:   ${pairsExternal.length.toLocaleString()}`);
+  console.log(`  Synthetic: ${pairsSynthetic.length.toLocaleString()}`);
+  console.log(`  Grammar:   ${pairsGrammar.length.toLocaleString()}`);
+  console.log(`  TOTAL:     ${allPairs.length.toLocaleString()}\n`);
+
+  if (allPairs.length < 500) {
+    console.error('[PRETRAIN v4.0] ERRO: menos de 500 pares — verifique _akie_vocab.js e corpus');
+    process.exit(1);
   }
 
-  // D) Pares gramaticais (gerado internamente)
-  const grammarPairs = generateGrammarPairsInternal(vocab, 500, CONFIG.maxSeqLen);
-
-  const allPairs = [...corpusPairs, ...externalPairs, ...identityPairs, ...grammarPairs];
-  console.log(`[PRETRAIN] Total de pares: ${allPairs.length.toLocaleString()}`);
-  console.log(`  Corpus embutido: ${corpusPairs.length.toLocaleString()}`);
-  console.log(`  Corpus externo:  ${externalPairs.length.toLocaleString()}`);
-  console.log(`  Identidade 10x:  ${identityPairs.length.toLocaleString()}`);
-  console.log(`  Gramatical:      ${grammarPairs.length.toLocaleString()}\n`);
-
-  if (allPairs.length < 1000) {
-    console.warn('[PRETRAIN] AVISO: menos de 1000 pares — considere rodar _akie_corpus_downloader.js antes.');
-  }
-
-  // 6. Loop de treinamento
+  // 6. Treinar
   const t0 = Date.now();
-  fs.mkdirSync(CONFIG.outputDir, { recursive: true });
 
-  for (let epoch = 1; epoch <= CONFIG.epochs; epoch++) {
-    const epochStart = Date.now();
-    const result     = await trainEpoch(model, allPairs, CONFIG.batchSize, epoch, CONFIG.epochs);
-    const elapsed    = ((Date.now() - epochStart) / 1000).toFixed(1);
-    const loss       = result.loss     !== null ? result.loss.toFixed(4)               : 'n/a';
-    const acc        = result.accuracy !== null ? (result.accuracy * 100).toFixed(1) + '%' : 'n/a';
+  for (let epoch = 1; epoch <= EPOCHS; epoch++) {
+    const t1 = Date.now();
+    const result = await trainEpoch(model, allPairs, BATCH_SIZE, epoch, EPOCHS);
+    const elapsed = ((Date.now()-t1)/1000).toFixed(1);
+    const lossStr = result.loss  !== null ? result.loss.toFixed(4)               : 'n/a';
+    const accStr  = result.acc   !== null ? (result.acc*100).toFixed(1)+'%'      : 'n/a';
 
-    console.log(`\n[PRETRAIN] ✓ Epoch ${epoch}/${CONFIG.epochs} | loss=${loss} acc=${acc} | ${result.steps} steps | ${elapsed}s`);
+    console.log(`\n[PRETRAIN v4.0] Epoch ${epoch}/${EPOCHS} | loss=${lossStr} acc=${accStr} | steps=${result.steps} | ${elapsed}s`);
 
-    // Checkpoint a cada 5 épocas ou na última
-    if (epoch % 5 === 0 || epoch === CONFIG.epochs) {
-      const ckptDir = path.join(CONFIG.outputDir, `checkpoint_epoch_${epoch}`);
-      await model.save(ckptDir);
-      console.log(`[PRETRAIN] Checkpoint salvo: ${ckptDir}`);
+    // Checkpoint a cada 2 epochs e no final
+    if (epoch % 2 === 0 || epoch === EPOCHS) {
+      const ckpt = path.join(OUT_DIR, `checkpoint_epoch_${epoch}`);
+      await model.save(ckpt);
+      console.log(`[PRETRAIN v4.0] Checkpoint: ${ckpt}`);
     }
   }
 
-  // 7. Salvar modelo final
-  console.log('\n[PRETRAIN] Salvando modelo final...');
-  await model.save(CONFIG.outputDir);
+  // 7. Salvar modelo final + vocab
+  console.log('\n[PRETRAIN v4.0] Salvando modelo final...');
+  await model.save(OUT_DIR);
+  fs.writeFileSync(
+    path.join(OUT_DIR, 'akie_vocab.json'),
+    JSON.stringify(vocab.toJSON(), null, 2)
+  );
 
-  // Salvar vocab na raiz do output
-  const vocabPath = path.join(CONFIG.outputDir, 'akie_vocab.json');
-  fs.writeFileSync(vocabPath, JSON.stringify(vocab.toJSON(), null, 2));
-  console.log(`[PRETRAIN] Vocab salvo: ${vocabPath}`);
-
-  const totalMin = ((Date.now() - t0) / 1000 / 60).toFixed(1);
-
-  console.log(`\n╔════════════════════════════════════════════════════╗`);
-  console.log(`║  PRÉ-TREINAMENTO CONCLUÍDO                         ║`);
-  console.log(`║  Tempo total:  ${totalMin} minutos`);
-  console.log(`║  Output:       ${CONFIG.outputDir}`);
-  console.log(`║  Parâmetros:   ${paramCount.toLocaleString()}`);
-  console.log(`║  Vocab:        ${vocab.size} tokens`);
-  console.log(`║  Pares treino: ${allPairs.length.toLocaleString()}`);
-  console.log(`╚════════════════════════════════════════════════════╝`);
-  console.log(`\n[PRÓXIMOS PASSOS]`);
-  console.log(`  1. cp -r ${CONFIG.outputDir}/* /data/akie_model/`);
-  console.log(`  2. pm2 restart akie-worker`);
-  console.log(`  3. Monitorar: pm2 logs akie-worker\n`);
+  const totalMin = ((Date.now()-t0)/1000/60).toFixed(1);
+  console.log(`\n[PRETRAIN v4.0] ============================================`);
+  console.log(`[PRETRAIN v4.0] CONCLUIDO em ${totalMin} minutos`);
+  console.log(`[PRETRAIN v4.0] Params:  ${paramCount.toLocaleString()}`);
+  console.log(`[PRETRAIN v4.0] Vocab:   ${vocab.size} tokens`);
+  console.log(`[PRETRAIN v4.0] Pares:   ${allPairs.length.toLocaleString()}`);
+  console.log(`[PRETRAIN v4.0] Output:  ${OUT_DIR}`);
+  console.log(`[PRETRAIN v4.0] ============================================`);
+  console.log(`\n[PRETRAIN v4.0] PROXIMOS PASSOS:`);
+  console.log(`  cp -r ${OUT_DIR}/* /opt/akie/model/`);
+  console.log(`  pm2 restart akie-worker\n`);
 }
 
-main().catch(err => {
-  console.error('[PRETRAIN] Erro fatal:', err.message);
-  console.error(err.stack);
+main().catch(e => {
+  console.error('\n[PRETRAIN v4.0] ERRO FATAL:', e.message);
+  console.error(e.stack);
   process.exit(1);
 });
