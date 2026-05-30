@@ -1,17 +1,18 @@
 /**
- * _nexus_neural.js  —  AKIE Neural Core v2.0 (Upgrade Moderado)
+ * _nexus_neural.js  —  AKIE Neural Core v3.0 (Escala LLM)
  *
- * MUDANÇAS ESTRUTURAIS:
- *   embDim:    64 → 128     (2x)
- *   hiddenSize: 128 → 256   (FFN interno dos blocos Transformer)
- *   maxSeqLen:  32 → 64     (2x contexto)
+ * MUDANÇAS ESTRUTURAIS v3.0:
+ *   embDim:     128 → 512    (4x)
+ *   hiddenSize: 256 → 2048   (FFN interno — 4x embDim, padrão GPT)
+ *   numHeads:   8   → 8      (headDim: 16 → 64)
+ *   numLayers:  2   → 6      (profundidade 3x)
+ *   maxSeqLen:  64  → 128    (2x contexto)
+ *   batchSize:  4   → 8      (VPS 8GB suporta)
  *
- * Parâmetros: ~260k → ~1.95M
+ * Parâmetros: ~720k → ~30M
  *
- * CORREÇÃO v2.0.1:
- *   - Removido ff_expand mal posicionado antes da atenção (causava reshape inválido)
- *   - Arquitetura Transformer Decoder correta: Embed → PosEmbed → [Norm → Attn → Res → Norm → FFN → Res] x2 → Norm → ExtractLast → Output
- *   - MultiHeadCausalAttention agora recebe embDim correto em todos os caminhos
+ * REQUER: pré-treinamento com _akie_pretrain.js antes de iniciar o worker.
+ * INCOMPATÍVEL com checkpoints v2.0 — reset obrigatório.
  */
 
 const tf = require('@tensorflow/tfjs-node');
@@ -70,21 +71,22 @@ try {
 module.exports.NaturalNLP = NaturalNLP;
 
 // ---------------------------------------------------------------------------
-// Hiperparâmetros — v2.0
+// Hiperparâmetros — v3.0 (~30M parâmetros)
 // ---------------------------------------------------------------------------
 
 const HPARAMS = {
-  embDim:            128,   // dimensão dos embeddings (numHeads * headDim = 8 * 16)
-  hiddenSize:        256,   // FFN interno dos blocos (embDim * 2)
-  maxSeqLen:          64,   // comprimento máximo de contexto
-  batchSize:           4,   // batches pequenos para RAM limitada no Railway
-  learningRate:    0.0005,
-  temperature:       0.6,
-  maxGenTokens:       40,
+  embDim:            512,   // dimensão dos embeddings (numHeads * headDim = 8 * 64)
+  hiddenSize:       2048,   // FFN interno (embDim * 4 — padrão GPT)
+  numLayers:           6,   // blocos Transformer (profundidade)
+  maxSeqLen:         128,   // contexto de 128 tokens
+  batchSize:           8,   // VPS 8GB suporta batchSize=8 com modelo 30M
+  learningRate:   0.0003,   // LR menor para modelo maior
+  temperature:       0.7,
+  maxGenTokens:       60,
   minNewData:          3,
   beamSize:            3,
-  repetitionPenalty: 1.2,
-  modelVersion:     '2.0',
+  repetitionPenalty: 1.3,
+  modelVersion:     '3.0',
 };
 
 // ---------------------------------------------------------------------------
@@ -93,15 +95,14 @@ const HPARAMS = {
 
 /**
  * Multi-Head Causal Attention.
- * IMPORTANTE: espera entrada com última dimensão == embDim (não hiddenSize).
- * numHeads=8, headDim=16 → embDim=128. Sempre consistente com HPARAMS.embDim.
+ * v3.0: numHeads=8, headDim=64 → embDim=512
  */
 class MultiHeadCausalAttention extends tf.layers.Layer {
   constructor(config) {
     super(config || {});
     this.numHeads = config.numHeads || 8;
-    this.headDim  = config.headDim  || 16;
-    this.embDim   = this.numHeads * this.headDim; // 8 * 16 = 128
+    this.headDim  = config.headDim  || 64;
+    this.embDim   = this.numHeads * this.headDim; // 8 * 64 = 512
   }
 
   build(inputShape) {
@@ -289,14 +290,14 @@ class AKIEModel {
   // ─────────────────────────────────────────────────────────────────────────
 
   build() {
-    const { embDim, hiddenSize, maxSeqLen } = this.hparams;
+    const { embDim, hiddenSize, maxSeqLen, numLayers = 6 } = this.hparams;
     const vocabSize = this.embeddingVocabSize > 0 ? this.embeddingVocabSize : this.vocab.size;
     const numHeads  = 8;
-    const headDim   = Math.floor(embDim / numHeads); // 128 / 8 = 16
+    const headDim   = Math.floor(embDim / numHeads); // 512 / 8 = 64
 
     const input = tf.input({ shape: [maxSeqLen], dtype: 'int32', name: 'context' });
 
-    // 1. Token Embedding: [batch, maxSeqLen] → [batch, maxSeqLen, 128]
+    // 1. Token Embedding
     const tokenEmbedded = new TokenEmbedding({
       inputDim:    vocabSize,
       outputDim:   embDim,
@@ -304,40 +305,32 @@ class AKIEModel {
       name: 'token_embedding',
     }).apply(input);
 
-    // 2. Positional Embedding: soma posições → [batch, maxSeqLen, 128]
+    // 2. Positional Embedding
     let x = new AddPositionalEmbedding({
       maxSeqLen,
       embDim,
       name: 'pos_embedding',
     }).apply(tokenEmbedded);
 
-    // ── Bloco Transformer Decoder 1 ──────────────────────────────────────
-    // Pre-norm → Atenção → Residual
-    const norm1_1 = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'norm1_1' }).apply(x);
-    const attn1   = new MultiHeadCausalAttention({ numHeads, headDim, name: 'attn_1' }).apply(norm1_1);
-    const res1    = tf.layers.add({ name: 'add1_1' }).apply([x, attn1]);
+    // ── N blocos Transformer Decoder ─────────────────────────────────────
+    for (let i = 0; i < numLayers; i++) {
+      // Pre-norm → Atenção → Residual
+      const normA = tf.layers.layerNormalization({ epsilon: 1e-5, name: `norm${i}_attn` }).apply(x);
+      const attn  = new MultiHeadCausalAttention({ numHeads, headDim, name: `attn_${i}` }).apply(normA);
+      const resA  = tf.layers.add({ name: `add${i}_attn` }).apply([x, attn]);
 
-    // Pre-norm → FFN (embDim→hiddenSize→embDim) → Residual
-    const norm1_2 = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'norm1_2' }).apply(res1);
-    const ffn1_up = tf.layers.dense({ units: hiddenSize, activation: 'relu', name: 'ffn1_up' }).apply(norm1_2);
-    const ffn1_dn = tf.layers.dense({ units: embDim, name: 'ffn1_dn' }).apply(ffn1_up);
-    const block1  = tf.layers.add({ name: 'add1_2' }).apply([res1, ffn1_dn]);
-
-    // ── Bloco Transformer Decoder 2 ──────────────────────────────────────
-    const norm2_1 = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'norm2_1' }).apply(block1);
-    const attn2   = new MultiHeadCausalAttention({ numHeads, headDim, name: 'attn_2' }).apply(norm2_1);
-    const res2    = tf.layers.add({ name: 'add2_1' }).apply([block1, attn2]);
-
-    const norm2_2 = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'norm2_2' }).apply(res2);
-    const ffn2_up = tf.layers.dense({ units: hiddenSize, activation: 'relu', name: 'ffn2_up' }).apply(norm2_2);
-    const ffn2_dn = tf.layers.dense({ units: embDim, name: 'ffn2_dn' }).apply(ffn2_up);
-    const block2  = tf.layers.add({ name: 'add2_2' }).apply([res2, ffn2_dn]);
+      // Pre-norm → FFN → Residual
+      const normF  = tf.layers.layerNormalization({ epsilon: 1e-5, name: `norm${i}_ffn` }).apply(resA);
+      const ffnUp  = tf.layers.dense({ units: hiddenSize, activation: 'relu', name: `ffn${i}_up` }).apply(normF);
+      const ffnDn  = tf.layers.dense({ units: embDim, name: `ffn${i}_dn` }).apply(ffnUp);
+      x = tf.layers.add({ name: `add${i}_ffn` }).apply([resA, ffnDn]);
+    }
 
     // 3. Normalização final + extração do último token
-    const finalNorm = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'final_norm' }).apply(block2);
+    const finalNorm = tf.layers.layerNormalization({ epsilon: 1e-5, name: 'final_norm' }).apply(x);
     const lastToken = new ExtractLastToken({ name: 'extract_last' }).apply(finalNorm);
 
-    // 4. Projeção para vocabulário com softmax
+    // 4. Projeção para vocabulário
     const output = tf.layers.dense({
       units: vocabSize,
       activation: 'softmax',
@@ -355,7 +348,7 @@ class AKIEModel {
     this.ready = true;
     if (this.embeddingVocabSize === 0) this.embeddingVocabSize = vocabSize;
 
-    console.log(`[AKIE] Transformer v2.0 construído: embDim=${embDim}, hiddenSize=${hiddenSize}, maxSeqLen=${maxSeqLen}, vocab=${vocabSize}, params=${this.model.countParams().toLocaleString()}`);
+    console.log(`[AKIE] Transformer v3.0 construído: embDim=${embDim}, hiddenSize=${hiddenSize}, layers=${numLayers}, maxSeqLen=${maxSeqLen}, vocab=${vocabSize}, params=${this.model.countParams().toLocaleString()}`);
     return this;
   }
 
@@ -728,8 +721,6 @@ class AKIEModel {
 
   setLearningRate(lr) {
     if (!this.ready || !lr || lr <= 0) return;
-    // tf.train.adam não expõe setter direto — recria o otimizador e recompila.
-    // Operação leve: não afeta pesos, apenas o estado momentos do otimizador.
     this.hparams.learningRate = lr;
     this.optimizer = tf.train.adam(lr);
     this.model.compile({
@@ -741,7 +732,7 @@ class AKIEModel {
 
   getStats() {
     return {
-      architecture:       'Causal Transformer Decoder v2.0',
+      architecture:       'Causal Transformer Decoder v3.0',
       ready:              this.ready,
       vocabSize:          this.vocab.size,
       embeddingVocabSize: this.embeddingVocabSize,
